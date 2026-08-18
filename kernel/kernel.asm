@@ -26,6 +26,19 @@ BITMAP_FRAMES  equ 262144  ; cobre o primeiro 1 GiB (o que o stage2 mapeou); bit
 HEADER_SIZE equ 24   ; kmalloc: size(8) + used(8) + next(8)
 SHELL_BUF_SIZE equ 128
 
+; ring 3 (modo usuario): selectors da GDT64 montada pelo stage2 -- tem
+; que bater EXATAMENTE com boot/stage2.asm (mesmo risco de
+; dessincronia que KERNEL_SECTORS/E820_*, ja conferido byte a byte
+; via listing na hora de montar isso).
+USER_CODE_SEL equ 32
+USER_DATA_SEL equ 24
+TSS_SEL       equ 40
+TSS_ADDR      equ 0x5000
+
+USER_STACK_TOP equ 0x300000   ; 3 MiB -- dentro do 1 GiB identity-mapped
+SYSCALL_STACK_SIZE equ 8192   ; pilha DEDICADA pra TSS.RSP0 (nao pode ser a
+                                ; mesma que o codigo que entra em ring3 usa)
+
 kernel_entry:
     mov rsp, 0x90000
 
@@ -36,6 +49,7 @@ kernel_entry:
     call pic_remap
     call pit_init
     call pmm_init
+    call tss_init
     call pmm_report
 
     call pmm_test
@@ -47,6 +61,24 @@ kernel_entry:
     sti                  ; a partir daqui IRQ0 (timer) e IRQ1 (teclado) disparam
 
 .idle:
+    ; shell_execute roda AQUI, fora de qualquer contexto de interrupcao --
+    ; nao dentro do irq1_handler. Motivo: comandos que entram em ring3
+    ; (enter_usermode) fazem um "iretq" que so "retorna" quando o app
+    ; termina (syscall exit ou excecao); se isso acontecesse dentro do
+    ; handler do IRQ1, o EOI pro PIC (que so seria mandado DEPOIS do
+    ; irq1_handler voltar) nunca seria enviado, e o teclado parava de
+    ; gerar interrupcoes pro resto da sessao (bug real, pego testando
+    ; o comando "echo" -- ele trava esperando a 2a tecla justamente
+    ; porque a 1a chamada de enter_usermode, feita ainda dentro do IRQ1
+    ; do Enter, "comeu" o EOI daquele IRQ1).
+    cmp byte [command_pending], 0
+    je .no_command
+    mov byte [command_pending], 0
+    mov rsi, shell_buf
+    call shell_execute
+    mov rsi, msg_prompt
+    call print_string
+.no_command:
     hlt                  ; dorme ate a proxima interrupcao
     jmp .idle
 
@@ -104,6 +136,17 @@ pmm_init:
 .reserve_kernel:
     mov rax, KERNEL_LOAD_ADDR
     mov rdx, KERNEL_LOAD_ADDR + KERNEL_IMAGE_SIZE
+    call mark_range_used
+
+    ; area onde o comando "run" carrega apps do disco (0x200000) e a
+    ; pilha do modo usuario (abaixo de 0x300000) -- sem isso o PMM
+    ; poderia entregar esses frames pro alocador comum por cima delas.
+    mov rax, 0x200000
+    mov rdx, 0x210000
+    call mark_range_used
+
+    mov rax, 0x2F0000
+    mov rdx, 0x300000
     call mark_range_used
     ret
 
@@ -547,9 +590,10 @@ ata_read_sector:
 
 ; =======================================================================
 ; loader: le um "app" externo do disco (nao faz parte da imagem do
-; kernel) pra um endereco fixo e da um CALL nele. O app precisa terminar
-; com "ret" pra devolver o controle pro shell -- e so codigo de maquina
-; cru, sem acesso as funcoes do kernel (binario separado, sem link).
+; kernel) pra um endereco fixo e roda em RING 3 (enter_usermode). O app
+; e codigo de maquina cru, sem acesso as funcoes do kernel (binario
+; separado, sem link) -- so pode falar com o kernel via syscall
+; (int 0x80), terminando com a syscall exit (RAX=0).
 ; =======================================================================
 
 APP_LBA        equ 145        ; logo depois da area reservada pro kernel
@@ -572,11 +616,94 @@ load_and_run_app:
     mov rsi, msg_app_loaded
     call print_string
 
-    call APP_LOAD_ADDR
+    mov rdi, APP_LOAD_ADDR
+    call enter_usermode          ; roda o app em ring3 -- se ele travar/bugar,
+                                   ; o handler de excecao mata so ele (ver
+                                   ; isr_common_stub), o kernel nao cai junto
 
     mov rsi, msg_app_returned
     call print_string
     ret
+
+; run_ring3_test: entra em ring3 rodando ring3_test_app e volta quando
+; ele fizer a syscall de exit.
+run_ring3_test:
+    mov rdi, ring3_test_app
+    call enter_usermode
+
+    mov rsi, msg_ring3_returned
+    call print_string
+    ret
+
+; ring3_test_app: codigo que roda em ring 3 de verdade (CPL=3). Nao tem
+; acesso as funcoes do kernel nem pode executar instrucoes privilegiadas
+; (cli, out, etc travariam com #GP) -- so pode pedir coisas via syscall
+; (int 0x80). Isso aqui: syscall 1 (write) pra imprimir uma mensagem,
+; depois syscall 0 (exit) pra devolver o controle ao kernel.
+ring3_test_app:
+    mov rdi, ring3_test_msg
+    mov rax, 1
+    int 0x80
+
+    mov rax, 0
+    int 0x80
+    ; nunca deveria chegar aqui -- a syscall exit nao retorna pra ca
+
+ring3_test_msg db "Ola do ring 3! Se voce esta lendo isso, o isolamento de privilegio esta de pe.", 10, 0
+
+; run_ring3_priv_test: prova a prova ao contrario -- se CPL=3 fosse
+; encenacao (ex.: selector sem RPL=3 de verdade), "cli" rodaria sem
+; problema e o loop abaixo ficaria preso. Do jeito certo, a CPU recusa
+; com #GP, e o handler de excecao detecta que foi um programa ring3 (nao
+; o kernel), mata so ele e devolve o controle aqui -- ESTA funcao que
+; "retorna" quando isso acontece (mesmo truque do syscall exit).
+run_ring3_priv_test:
+    mov rdi, ring3_priv_test
+    call enter_usermode
+    mov rsi, msg_priv_survived
+    call print_string
+    ret
+
+ring3_priv_test:
+    cli                        ; instrucao privilegiada -- CPL=3 nao pode
+.loop:                          ; so chegaria aqui se a protecao NAO estivesse
+    jmp .loop                    ; funcionando (bug grave, nao o esperado)
+
+; run_ring3_echo_test: entra em ring3 rodando ring3_echo_test.
+run_ring3_echo_test:
+    mov rdi, ring3_echo_test
+    call enter_usermode
+
+    mov rsi, msg_echo_returned
+    call print_string
+    ret
+
+; ring3_echo_test: le caracteres um a um via syscall 2 (read_char, que
+; bloqueia ate uma tecla chegar) e ecoa cada um de volta via syscall 1
+; (write), montando uma "string" de 1 char no proprio stack de ring3
+; (pilha do usuario, nao a do kernel -- sem conflito com o int 0x80).
+; Termina quando aperta Enter.
+ring3_echo_test:
+    sub rsp, 16
+
+.loop:
+    mov rax, 2
+    int 0x80                    ; RAX = caractere lido
+
+    cmp al, 10                   ; enter -- termina o teste
+    je .exit
+
+    mov [rsp], al
+    mov byte [rsp + 1], 0
+    mov rdi, rsp
+    mov rax, 1
+    int 0x80
+
+    jmp .loop
+
+.exit:
+    mov rax, 0
+    int 0x80
 
 ; =======================================================================
 ; shell: interpreta a linha acumulada pelo irq1_handler no Enter.
@@ -616,6 +743,21 @@ shell_execute:
     call str_equal
     test al, al
     jnz .do_run
+
+    mov rdi, cmd_user
+    call str_equal
+    test al, al
+    jnz .do_user
+
+    mov rdi, cmd_priv
+    call str_equal
+    test al, al
+    jnz .do_priv
+
+    mov rdi, cmd_echo
+    call str_equal
+    test al, al
+    jnz .do_echo
 
     push rsi
     mov rsi, msg_unknown_cmd
@@ -680,6 +822,18 @@ shell_execute:
 
 .do_run:
     call load_and_run_app
+    jmp .done
+
+.do_user:
+    call run_ring3_test
+    jmp .done
+
+.do_priv:
+    call run_ring3_priv_test
+    jmp .done
+
+.do_echo:
+    call run_ring3_echo_test
 
 .done:
     ret
@@ -736,26 +890,51 @@ clear_screen:
 ; enderecos de label em tempo de montagem, que o NASM nao aceita bem
 ; em varios contextos de macro/rep).
 idt_install:
-    mov rdi, idt_table
-    mov rbx, isr_addr_table
-    xor rcx, rcx
+    mov r11, isr_addr_table
+    xor r10, r10
 .fill_loop:
-    mov rax, [rbx + rcx * 8]
+    mov rax, [r11 + r10 * 8]
+    mov rbx, r10
+    mov cl, 0x8E                  ; present, DPL0, interrupt gate 64-bit
+    call idt_set_gate
+    inc r10
+    cmp r10, ISR_COUNT
+    jl .fill_loop
+
+    ; vetor 128 (int 0x80, syscall): DPL=3, pra ring3 poder chamar via
+    ; "int 0x80" sem tomar #GP (as outras entradas ficam DPL0).
+    mov rax, isr128
+    mov rbx, 128
+    mov cl, 0xEE                   ; present, DPL3, interrupt gate 64-bit
+    call idt_set_gate
+
+    lidt [idt_descriptor]
+    ret
+
+; idt_set_gate: RAX=endereco do handler, RBX=vetor (0-255), CL=type_attr
+idt_set_gate:
+    push rax
+    push rdi
+    push rdx
+
+    mov rdi, idt_table
+    shl rbx, 4
+    add rdi, rbx
+
     mov [rdi], ax                  ; offset 0..15
     mov word [rdi + 2], CODE64_SEG
     mov byte [rdi + 4], 0
-    mov byte [rdi + 5], 0x8E       ; present, DPL0, interrupt gate 64-bit
-    shr rax, 16
-    mov [rdi + 6], ax              ; offset 16..31
-    shr rax, 16
-    mov [rdi + 8], eax             ; offset 32..63
+    mov [rdi + 5], cl
+    mov rdx, rax
+    shr rdx, 16
+    mov [rdi + 6], dx              ; offset 16..31
+    shr rdx, 16
+    mov [rdi + 8], edx             ; offset 32..63
     mov dword [rdi + 12], 0
-    add rdi, 16
-    inc rcx
-    cmp rcx, ISR_COUNT
-    jl .fill_loop
 
-    lidt [idt_descriptor]
+    pop rdx
+    pop rdi
+    pop rax
     ret
 
 ; ---------------------------------------------------------------------
@@ -859,6 +1038,11 @@ isr %+ %1:
 ISR_IRQ 32   ; IRQ0 - timer (PIT)
 ISR_IRQ 33   ; IRQ1 - teclado
 
+isr128:                      ; int 0x80 -- syscall (software, sem codigo de erro)
+    push qword 0
+    push qword 128
+    jmp isr_syscall_stub
+
 ; pilha no momento do isr_common_stub:
 ;   [rsp+0]  = numero do vetor
 ;   [rsp+8]  = codigo de erro (real ou 0)
@@ -890,13 +1074,33 @@ isr_common_stub:
     mov rdx, rbx
     call print_hex_byte
 
+    ; CS salvo pela CPU nesta pilha (sem GP regs empilhados aqui, ao
+    ; contrario do isr_irq_common_stub): [rsp+0]=vetor, [rsp+8]=errcode,
+    ; [rsp+16]=RIP, [rsp+24]=CS.
+    mov rcx, [rsp + 24]
+    and rcx, 3
+    cmp rcx, 3
+    je .ring3_fault
+
+    ; excecao dentro do proprio kernel (CPL0): sem estado seguro pra
+    ; voltar, entao para a maquina de verdade.
     mov rsi, msg_halted
     call print_string
-
 .halt:
     cli
     hlt
     jmp .halt
+
+.ring3_fault:
+    ; excecao dentro de um programa ring3: mata SO ele (troca de pilha +
+    ; "ret", igual a syscall exit) e devolve o controle pro shell -- o
+    ; kernel continua rodando normalmente.
+    mov rsi, msg_killed
+    call print_string
+    mov rsp, [kernel_saved_rsp]
+    sti                              ; mesmo motivo do sys_exit: RET manual nao
+                                       ; restaura RFLAGS sozinho, tem que religar IF
+    ret
 
 ; IRQ de hardware: precisa devolver o controle pro codigo interrompido,
 ; entao salva TODOS os registradores de proposito geral antes de despachar
@@ -1000,6 +1204,15 @@ irq1_handler:
     test al, al
     jz .done
 
+    ; se um app ring3 estiver bloqueado num sys_read_char, a tecla vai
+    ; pra ele (correio de 1 byte), NAO pro buffer do shell.
+    cmp byte [app_reading_input], 0
+    je .to_shell
+    mov [app_input_char], al
+    mov byte [app_input_ready], 1
+    jmp .done
+
+.to_shell:
     cmp al, 8                     ; backspace
     je .do_backspace
     cmp al, 10                     ; enter
@@ -1036,13 +1249,11 @@ irq1_handler:
 
     movzx rcx, byte [shell_len]
     mov byte [shell_buf + rcx], 0        ; termina a string digitada
-
-    mov rsi, shell_buf
-    call shell_execute
-
     mov byte [shell_len], 0
-    mov rsi, msg_prompt
-    call print_string
+
+    ; NAO executa aqui dentro do IRQ1 -- so sinaliza. Ver comentario no
+    ; ".idle" de kernel_entry pra entender o motivo (EOI do PIC).
+    mov byte [command_pending], 1
     jmp .done
 
 .shift_down:
@@ -1052,6 +1263,155 @@ irq1_handler:
     mov byte [shift_pressed], 0
 .done:
     ret
+
+; =======================================================================
+; syscall (int 0x80): unico jeito de codigo ring3 pedir algo ao kernel.
+; Convencao (bem simplificada, ainda sem validar ponteiros vindos do
+; ring3 -- limitacao conhecida, so vale porque hoje kernel e apps
+; dividem o mesmo espaco de enderecos, sem paginacao separada por
+; processo):
+;   RAX = 0 -> exit  (abandona o contexto ring3, volta pro chamador de
+;                      enter_usermode como se fosse um "return" normal)
+;   RAX = 1 -> write (RDI = ponteiro pra string terminada em 0)
+; =======================================================================
+isr_syscall_stub:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push rbp
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+    push r14
+    push r15
+
+    ; syscall 2 (read_char) pode ser chamada varias vezes seguidas (um
+    ; app lendo tecla por tecla) -- pula o print de CPL pra nao spammar
+    ; a tela; ele ja foi provado nas outras duas syscalls.
+    cmp rax, 2
+    je .sys_read_char
+
+    ; prova de que realmente estamos voltando de ring3: imprime o CPL
+    ; (bits 0-1 do CS salvo pela CPU) antes de fazer qualquer outra
+    ; coisa. Se isso imprimir 0, o iretq NAO mudou de anel (bug de
+    ; selector), mesmo que o resto da demo "funcione".
+    mov rdx, [rsp + 15 * 8 + 24]   ; CS salvo pela CPU (15 GP regs + vetor + errcode + RIP antes dele = 120+8+8+8)
+    and rdx, 3
+    push rsi
+    mov rsi, msg_syscall_cpl
+    call print_string
+    pop rsi
+    call print_hex_byte
+    push rsi
+    mov rsi, msg_newline2
+    call print_string
+    pop rsi
+
+    cmp rax, 0
+    je .sys_exit
+    cmp rax, 1
+    je .sys_write
+    jmp .sys_return
+
+.sys_write:
+    mov rsi, rdi
+    call print_string
+    jmp .sys_return
+
+; sys_read_char: bloqueia (com IF=1, via hlt) ate o irq1_handler
+; depositar um caractere no "correio" abaixo, e devolve ele em RAX.
+; Enquanto isso, o irq1_handler desvia TODO o teclado pra ca em vez de
+; mandar pro shell (ver flag app_reading_input).
+.sys_read_char:
+    mov byte [app_input_ready], 0
+    mov byte [app_reading_input], 1
+.wait_char:
+    sti
+    hlt
+    cmp byte [app_input_ready], 0
+    je .wait_char
+    mov byte [app_reading_input], 0
+
+    movzx rax, byte [app_input_char]
+    mov [rsp + 14 * 8], rax          ; sobrescreve o RAX que .sys_return vai restaurar
+    jmp .sys_return
+
+.sys_exit:
+    mov rsp, [kernel_saved_rsp]
+    sti                              ; entrar aqui (interrupt gate) desligou IF; como
+                                       ; esse "retorno" e um RET manual (nao iretq), tem
+                                       ; que religar na mao, senao o sistema fica surdo
+                                       ; pra interrupcoes pro resto da sessao
+    ret                              ; "retorna" de enter_usermode pro chamador
+
+.sys_return:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rbp
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+
+    add rsp, 16                       ; descarta vetor+errcode empilhados pelo isr128
+    iretq
+
+; tss_init: zera a TSS, seta RSP0 pra uma pilha DEDICADA (nao pode ser
+; a mesma que o codigo que chama enter_usermode ja esta usando -- senao
+; o frame de int 0x80 vindo de ring3 pisa em cima de frames ainda
+; vivos), desativa o bitmap de I/O, e carrega a TSS com "ltr".
+tss_init:
+    push rax
+    push rcx
+    push rdi
+
+    mov rdi, TSS_ADDR
+    xor rax, rax
+    mov rcx, 13                       ; 104 bytes / 8
+    rep stosq
+
+    mov rax, syscall_stack + SYSCALL_STACK_SIZE
+    mov [TSS_ADDR + 4], rax           ; RSP0
+
+    mov word [TSS_ADDR + 102], 0x0068 ; IO map base = fora do limite -> sem bitmap
+
+    mov ax, TSS_SEL
+    ltr ax
+
+    pop rdi
+    pop rcx
+    pop rax
+    ret
+
+; enter_usermode: RDI = endereco de entrada em ring3. Ao chamar a
+; syscall "exit" (RAX=0), a execucao volta pra CA, como se esta funcao
+; tivesse retornado normalmente (troca de RSP + "ret" no handler).
+enter_usermode:
+    mov [kernel_saved_rsp], rsp
+
+    push qword (USER_DATA_SEL | 3)
+    push qword USER_STACK_TOP
+    pushfq
+    or qword [rsp], 0x200            ; forca IF=1 -- ring3 nao pode religar
+                                       ; interrupcoes sozinho (cli/sti sao
+                                       ; privilegiadas), entao decidimos aqui
+    push qword (USER_CODE_SEL | 3)
+    push rdi
+    iretq
 
 isr_addr_table:
     dq isr0, isr1, isr2, isr3, isr4, isr5, isr6, isr7
@@ -1230,6 +1590,10 @@ hex_nibble_to_ascii:
 cursor_row dq 0
 cursor_col dq 0
 shift_pressed db 0
+app_reading_input db 0
+app_input_char    db 0
+app_input_ready    db 0
+command_pending     db 0
 timer_ticks dq 0
 
 msg_boot       db "EVA kernel: IDT + PIC + PIT + teclado + PMM ativos.", 10, 0
@@ -1238,7 +1602,8 @@ msg_exception  db "[EXCECAO] ", 0
 msg_unknown_name db "(reservado/desconhecido)", 0
 msg_vector     db " vetor=0x", 0
 msg_errcode    db " erro=0x", 0
-msg_halted     db " -- CPU parada.", 10, 0
+msg_halted     db " -- excecao no kernel (CPL0), sem como continuar. CPU parada.", 10, 0
+msg_killed     db " -- programa ring3 encerrado pela excecao. Kernel continua.", 10, 0
 msg_no_return  db "ERRO INTERNO: retornou da excecao (nao deveria acontecer)", 10, 0
 
 msg_pmm_free   db "PMM: frames livres = 0x", 0
@@ -1255,13 +1620,21 @@ shell_len db 0
 
 msg_prompt      db "EVA> ", 0
 msg_unknown_cmd db "comando desconhecido: ", 0
-msg_help_text   db "comandos: help  mem  clear  about  disk  run", 10, 0
+msg_help_text   db "comandos: help  mem  clear  about  disk  run  user  priv  echo", 10, 0
 msg_about       db "EVA OS - kernel experimental em Assembly (modo longo 64-bit)", 10, 0
 msg_disk_ok     db "disk: leu o setor de boot (LBA 0) via ATA PIO -- assinatura 55 AA OK", 10, 0
 msg_disk_fail   db "disk: leu o setor, mas a assinatura de boot nao bateu", 10, 0
 msg_disk_nomem  db "disk: sem memoria pro buffer de leitura", 10, 0
 msg_app_loaded  db "run: app carregado do disco (LBA 145), chamando...", 10, 0
 msg_app_returned db "run: app retornou pro shell.", 10, 0
+msg_ring3_returned db "user: syscall exit recebida, de volta ao shell (ring0).", 10, 0
+msg_priv_survived  db "priv: o kernel sobreviveu ao crash do programa ring3.", 10, 0
+msg_echo_returned  db "echo: syscall exit recebida, de volta ao shell.", 10, 0
+msg_syscall_cpl db "[syscall] CPL=0x", 0
+
+kernel_saved_rsp dq 0
+align 16
+syscall_stack: times SYSCALL_STACK_SIZE db 0
 
 cmd_help  db "help", 0
 cmd_mem   db "mem", 0
@@ -1269,6 +1642,9 @@ cmd_clear db "clear", 0
 cmd_about db "about", 0
 cmd_disk  db "disk", 0
 cmd_run   db "run", 0
+cmd_user  db "user", 0
+cmd_priv  db "priv", 0
+cmd_echo  db "echo", 0
 
 ; scancode (set 1, make code) -> ASCII. 0 = ignorado (tecla nao mapeada).
 align 8

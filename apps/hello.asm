@@ -1,38 +1,24 @@
 ; EVA - primeiro "app" de teste: nao faz parte da imagem do kernel, fica
 ; numa area separada do disco e e carregado em runtime pelo comando "run"
-; do shell (kernel/kernel.asm: load_and_run_app). Convencao: o kernel da
-; um "call" nesse endereco, entao o app termina com "ret" pra devolver o
-; controle. Sem acesso as funcoes do kernel (binario separado, sem link)
-; -- por isso escreve direto no hardware (VGA + serial), do mesmo jeito
-; que o proprio kernel faz.
+; do shell (kernel/kernel.asm: load_and_run_app). Roda em RING 3 de
+; verdade (via enter_usermode) -- por isso nao acessa hardware direto
+; (VGA/serial/portas de I/O sao privilegiados, dariam #GP), so pode se
+; comunicar com o kernel via syscall (int 0x80):
+;   RAX=1 (write) -> RDI = ponteiro pra string terminada em 0
+;   RAX=0 (exit)  -> devolve o controle pro kernel
 
 BITS 64
 ORG 0x200000
 
 app_entry:
-    mov rdi, 0xB8000 + (10 * 160)   ; linha 10, pra nao brigar com o prompt
-    mov rsi, msg
-.vga_loop:
-    lodsb
-    test al, al
-    jz .vga_done
-    mov byte [rdi], al
-    mov byte [rdi + 1], 0x0A          ; verde sobre preto, pra se destacar
-    add rdi, 2
-    jmp .vga_loop
-.vga_done:
+    mov rdi, msg
+    mov rax, 1
+    int 0x80
 
-    mov rsi, msg
-.serial_loop:
-    lodsb
-    test al, al
-    jz .done
-    mov dx, 0x3F8
-    out dx, al
-    jmp .serial_loop
-.done:
-    ret
+    mov rax, 0
+    int 0x80
+    ; nunca deveria chegar aqui -- a syscall exit nao retorna pra ca
 
-msg db "Hello do EVA! Este programa foi carregado do disco em runtime.", 0
+msg db "Hello do EVA! Programa carregado do disco, rodando em ring 3.", 10, 0
 
 times (8 * 512) - ($ - $$) db 0

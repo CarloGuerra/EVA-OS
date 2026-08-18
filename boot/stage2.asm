@@ -21,6 +21,10 @@ KERNEL_SIZE_QWORDS equ KERNEL_SIZE / 8
 E820_COUNT_ADDR equ 0x4000       ; dword: quantidade de entradas
 E820_MAP_ADDR   equ 0x4008       ; array de entradas, 24 bytes cada
 
+; onde a TSS vive (o kernel preenche o RSP0 e da "ltr" nela). Precisa
+; bater com o mesmo valor em kernel/kernel.asm.
+TSS_ADDR equ 0x5000
+
 ORG 0x8000
 
 ; ---------------------------------------------------------------------
@@ -144,11 +148,11 @@ setup_page_tables:
     mov ecx, 3072            ; 3 tabelas * 4096 bytes / 4 = 3072 dwords
     rep stosd
 
-    mov dword [0x1000], 0x2000 | 0x3   ; PML4[0] -> PDPT
-    mov dword [0x2000], 0x3000 | 0x3   ; PDPT[0] -> PD
+    mov dword [0x1000], 0x2000 | 0x7   ; PML4[0] -> PDPT (present+writable+user)
+    mov dword [0x2000], 0x3000 | 0x7   ; PDPT[0] -> PD   (present+writable+user)
 
     mov edi, 0x3000
-    mov eax, 0x83                      ; present, writable, page-size(2MiB)
+    mov eax, 0x87                      ; present, writable, user, page-size(2MiB)
     mov ecx, 512                       ; 512 entradas = 1 GiB
 .fill_pd:
     mov [edi], eax
@@ -226,7 +230,10 @@ CODE32_SEG equ gdt32_code - gdt32
 DATA32_SEG equ gdt32_data - gdt32
 
 ; ---------------------------------------------------------------------
-; GDT de 64 bits (modo longo)
+; GDT de 64 bits (modo longo) -- kernel (ring0) + usuario (ring3) + TSS.
+; Ordem importa pros calculos de offset abaixo, mas nao ha convencao
+; SYSCALL/SYSRET envolvida aqui (usamos int 0x80), entao a ordem em si
+; e livre; so precisa bater com os valores hardcoded em kernel/kernel.asm.
 ; ---------------------------------------------------------------------
 align 8
 gdt64:
@@ -245,13 +252,39 @@ gdt64_data:
     db 10010010b
     db 00000000b
     db 0
+gdt64_user_data:
+    dw 0
+    dw 0
+    db 0
+    db 11110010b   ; present, DPL=3, S=1, dados r/w
+    db 00000000b
+    db 0
+gdt64_user_code:
+    dw 0
+    dw 0
+    db 0
+    db 11111010b   ; present, DPL=3, S=1, codigo exec/read
+    db 10101111b     ; granularity=1, L=1, limit19:16=0
+    db 0
+gdt64_tss:
+    dw 0x0067                          ; limit = 103 (tamanho da TSS - 1)
+    dw TSS_ADDR & 0xFFFF
+    db (TSS_ADDR >> 16) & 0xFF
+    db 10001001b                        ; present, DPL0, tipo=1001 (TSS 64-bit disponivel)
+    db 00000000b
+    db (TSS_ADDR >> 24) & 0xFF
+    dd (TSS_ADDR >> 32) & 0xFFFFFFFF
+    dd 0
 gdt64_end:
 
 gdt64_descriptor:
     dw gdt64_end - gdt64 - 1
     dq gdt64
 
-CODE64_SEG equ gdt64_code - gdt64
-DATA64_SEG equ gdt64_data - gdt64
+CODE64_SEG      equ gdt64_code - gdt64
+DATA64_SEG      equ gdt64_data - gdt64
+USER_DATA64_SEG equ gdt64_user_data - gdt64
+USER_CODE64_SEG equ gdt64_user_code - gdt64
+TSS64_SEG       equ gdt64_tss - gdt64
 
 times (512 * 16) - ($ - $$) db 0

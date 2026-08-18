@@ -39,6 +39,21 @@ USER_STACK_TOP equ 0x300000   ; 3 MiB -- dentro do 1 GiB identity-mapped
 SYSCALL_STACK_SIZE equ 8192   ; pilha DEDICADA pra TSS.RSP0 (nao pode ser a
                                 ; mesma que o codigo que entra em ring3 usa)
 
+; EVAFS: sistema de arquivos proprio, bem simples de proposito -- sem
+; subdiretorios, sem fragmentacao (alocacao contigua via ponteiro que so
+; cresce, nunca reaproveita espaco de arquivo apagado/sobrescrito).
+;   LBA 200      : superbloco (1 setor)
+;   LBA 201-202  : diretorio (2 setores = 32 entradas de 32 bytes)
+;   LBA 210+     : dados dos arquivos
+FS_MAGIC          equ 0x53464145   ; "EAFS" lido como dword little-endian
+FS_SUPERBLOCK_LBA equ 200
+FS_DIR_LBA        equ 201
+FS_DIR_SECTORS    equ 2
+FS_DATA_START_LBA equ 210
+FS_MAX_FILES      equ 32
+FS_ENTRY_SIZE     equ 32           ; name[24] + start_lba(4) + size_bytes(4)
+FS_NAME_MAX       equ 23           ; 23 chars + terminador dentro dos 24
+
 kernel_entry:
     mov rsp, 0x90000
 
@@ -50,6 +65,7 @@ kernel_entry:
     call pit_init
     call pmm_init
     call tss_init
+    call fs_init
     call pmm_report
 
     call pmm_test
@@ -588,6 +604,595 @@ ata_read_sector:
     pop rax
     ret
 
+; ata_write_sector: RDI = LBA (28 bits), RSI = buffer origem (512 bytes).
+; Mesmo protocolo do ata_read_sector, mas com o comando WRITE SECTORS
+; (0x30) e transferindo os dados na direcao contraria.
+ata_write_sector:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+
+    mov rbx, rdi
+
+    mov dx, 0x1F6
+    mov rax, rbx
+    shr rax, 24
+    and al, 0x0F
+    or al, 0xE0
+    out dx, al
+
+    mov dx, 0x1F2
+    mov al, 1
+    out dx, al
+
+    mov dx, 0x1F3
+    mov al, bl
+    out dx, al
+
+    mov dx, 0x1F4
+    mov rax, rbx
+    shr rax, 8
+    out dx, al
+
+    mov dx, 0x1F5
+    mov rax, rbx
+    shr rax, 16
+    out dx, al
+
+    mov dx, 0x1F7
+    mov al, 0x30                      ; comando WRITE SECTORS
+    out dx, al
+
+.wait:
+    in al, dx
+    test al, 0x80                      ; BSY?
+    jnz .wait
+    test al, 0x08                       ; DRQ (pronto pra receber dados)?
+    jz .wait
+    test al, 0x01                        ; ERR?
+    jnz .done
+
+    mov dx, 0x1F0
+    mov rcx, 256                          ; 256 words = 512 bytes
+.write_loop:
+    mov ax, [rsi]
+    out dx, ax
+    add rsi, 2
+    loop .write_loop
+
+    ; flush cache -- garante que o setor realmente foi pro "disco" antes
+    ; de seguir (relevante pra emulacao tambem, nao so hardware real).
+    mov dx, 0x1F7
+    mov al, 0xE7
+    out dx, al
+.flush_wait:
+    in al, dx
+    test al, 0x80
+    jnz .flush_wait
+
+.done:
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; =======================================================================
+; EVAFS: sistema de arquivos proprio (ver constantes FS_* no topo do
+; arquivo pra layout no disco). fs_directory e os campos fs_next_free_lba
+; /fs_file_count sao a copia em memoria; toda escrita re-persiste os
+; dois de volta pro disco antes de retornar (sem cache, sem journaling
+; -- simplicidade de proposito nesta primeira versao).
+; =======================================================================
+
+; fs_init: le o superbloco do disco. Se a assinatura nao bater, o disco
+; nunca foi formatado -- fs_ready fica 0 e os outros comandos avisam pra
+; rodar "format" em vez de tentar operar em cima de lixo.
+fs_init:
+    mov rdi, FS_SUPERBLOCK_LBA
+    mov rsi, fs_io_buf
+    call ata_read_sector
+
+    mov eax, [fs_io_buf]
+    cmp eax, FS_MAGIC
+    jne .not_formatted
+
+    mov eax, [fs_io_buf + 4]
+    mov [fs_next_free_lba], eax
+    mov eax, [fs_io_buf + 8]
+    mov [fs_file_count], eax
+
+    mov rdi, FS_DIR_LBA
+    mov rsi, fs_directory
+    call ata_read_sector
+    mov rdi, FS_DIR_LBA + 1
+    mov rsi, fs_directory + 512
+    call ata_read_sector
+
+    mov byte [fs_ready], 1
+    ret
+
+.not_formatted:
+    mov byte [fs_ready], 0
+    ret
+
+; fs_format: zera o diretorio em memoria, reseta o alocador, e grava
+; tudo no disco -- comando explicito ("format"), nunca automatico,
+; porque destroi qualquer conteudo anterior.
+fs_format:
+    mov rdi, fs_directory
+    xor rax, rax
+    mov rcx, (FS_MAX_FILES * FS_ENTRY_SIZE) / 8
+    rep stosq
+
+    mov dword [fs_next_free_lba], FS_DATA_START_LBA
+    mov dword [fs_file_count], 0
+    mov byte [fs_ready], 1
+
+    call fs_sync
+
+    mov rsi, msg_fs_formatted
+    call print_string
+    ret
+
+; fs_sync: grava o superbloco e o diretorio (copia em memoria) de volta
+; no disco. Chamado depois de toda operacao que muda o estado do FS.
+fs_sync:
+    push rax
+
+    mov rdi, fs_io_buf
+    xor rax, rax
+    mov rcx, 512 / 8
+    rep stosq
+    mov eax, FS_MAGIC
+    mov [fs_io_buf], eax
+    mov eax, [fs_next_free_lba]
+    mov [fs_io_buf + 4], eax
+    mov eax, [fs_file_count]
+    mov [fs_io_buf + 8], eax
+
+    mov rdi, FS_SUPERBLOCK_LBA
+    mov rsi, fs_io_buf
+    call ata_write_sector
+
+    mov rdi, FS_DIR_LBA
+    mov rsi, fs_directory
+    call ata_write_sector
+    mov rdi, FS_DIR_LBA + 1
+    mov rsi, fs_directory + 512
+    call ata_write_sector
+
+    pop rax
+    ret
+
+; fs_find_entry: RDI = ponteiro pro nome (terminado em 0). Retorna
+; RAX = ponteiro pra entrada do diretorio em memoria, ou 0 se nao achar.
+fs_find_entry:
+    push rbx
+    push rcx
+    push rsi
+    push rdi
+
+    mov rbx, fs_directory
+    mov rcx, FS_MAX_FILES
+.scan:
+    cmp byte [rbx], 0
+    je .next
+
+    mov rsi, rbx
+    call str_equal
+    test al, al
+    jnz .found
+
+.next:
+    add rbx, FS_ENTRY_SIZE
+    loop .scan
+
+    xor rax, rax
+    jmp .done
+.found:
+    mov rax, rbx
+.done:
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rbx
+    ret
+
+; fs_find_free_slot: retorna RAX = ponteiro pra primeira entrada vazia
+; do diretorio, ou 0 se estiver cheio.
+fs_find_free_slot:
+    push rbx
+    push rcx
+
+    mov rbx, fs_directory
+    mov rcx, FS_MAX_FILES
+.scan:
+    cmp byte [rbx], 0
+    je .found
+    add rbx, FS_ENTRY_SIZE
+    loop .scan
+
+    xor rax, rax
+    jmp .done
+.found:
+    mov rax, rbx
+.done:
+    pop rcx
+    pop rbx
+    ret
+
+; fs_write_file: RDI = nome (terminado em 0), RSI = conteudo (terminado
+; em 0). Aloca espaco novo SEMPRE (nao reaproveita, mesmo sobrescrevendo
+; um nome existente -- simplicidade de proposito), grava o conteudo e
+; atualiza/persiste o diretorio.
+fs_write_file:
+    push rbx
+    push r9
+    push r10
+    push r12
+    push r13
+    push r14
+    push r15
+
+    cmp byte [fs_ready], 0
+    je .not_ready
+
+    mov r12, rdi                     ; nome
+    mov r13, rsi                     ; conteudo
+
+    xor rcx, rcx
+.strlen:
+    cmp byte [r13 + rcx], 0
+    je .strlen_done
+    inc rcx
+    jmp .strlen
+.strlen_done:
+    mov r14, rcx                     ; r14 = tamanho em bytes
+
+    ; entrada existente com o mesmo nome? senao, um slot livre
+    mov rdi, r12
+    call fs_find_entry
+    test rax, rax
+    jnz .have_slot
+    call fs_find_free_slot
+    test rax, rax
+    jz .full
+    inc dword [fs_file_count]
+.have_slot:
+    mov rbx, rax                     ; rbx = ponteiro pra entrada do diretorio
+
+    ; setores necessarios (minimo 1, mesmo arquivo vazio)
+    mov r9, r14
+    add r9, 511
+    shr r9, 9
+    test r9, r9
+    jnz .sectors_ok
+    mov r9, 1
+.sectors_ok:
+
+    mov r15d, [fs_next_free_lba]      ; LBA inicial deste arquivo
+    xor r10, r10                       ; indice do setor atual (0..r9-1)
+
+.write_loop:
+    ; monta o setor em fs_io_buf: ate 512 bytes do conteudo, resto zero
+    mov rdi, fs_io_buf
+    xor rax, rax
+    mov rcx, 512 / 8
+    rep stosq
+
+    mov rax, r10
+    shl rax, 9                          ; offset (em bytes) do inicio deste setor
+
+    xor rcx, rcx
+.copy_byte:
+    cmp rcx, 512
+    jae .copy_done
+    mov rdx, rax
+    add rdx, rcx                          ; posicao absoluta no conteudo
+    cmp rdx, r14
+    jae .copy_done                          ; passou do tamanho real -- resto fica zero
+    mov rsi, r13
+    add rsi, rdx
+    mov dl, [rsi]
+    mov [fs_io_buf + rcx], dl
+    inc rcx
+    jmp .copy_byte
+.copy_done:
+
+    mov rdi, r15
+    add rdi, r10
+    mov rsi, fs_io_buf
+    call ata_write_sector
+
+    inc r10
+    cmp r10, r9
+    jb .write_loop
+
+    ; atualiza a entrada do diretorio e persiste
+    mov rdi, rbx
+    mov rsi, r12
+    call str_copy_bounded
+    mov eax, r15d
+    mov [rbx + 24], eax                       ; start_lba
+    mov eax, r14d
+    mov [rbx + 28], eax                       ; size_bytes
+
+    add [fs_next_free_lba], r9d
+
+    call fs_sync
+
+    mov rsi, msg_fs_write_ok
+    call print_string
+    jmp .done
+
+.not_ready:
+    mov rsi, msg_fs_not_ready
+    call print_string
+    jmp .done
+.full:
+    mov rsi, msg_fs_full
+    call print_string
+
+.done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop r10
+    pop r9
+    pop rbx
+    ret
+
+; fs_read_file: RDI = nome (terminado em 0). Imprime o conteudo, byte a
+; byte, sem assumir que e uma string terminada em 0 (le exatamente
+; "size_bytes" bytes, ainda que o arquivo tenha zeros no meio).
+fs_read_file:
+    push rbx
+    push r12
+    push r13
+    push r14
+
+    cmp byte [fs_ready], 0
+    je .not_ready
+
+    call fs_find_entry
+    test rax, rax
+    jz .not_found
+    mov rbx, rax
+
+    mov r12d, [rbx + 24]              ; start_lba
+    mov r13d, [rbx + 28]              ; size_bytes restante a imprimir
+    xor r14, r14                       ; setor atual (offset a partir do start_lba)
+
+.read_loop:
+    cmp r13, 0
+    jbe .done
+
+    mov rax, r12
+    add rax, r14
+    mov rdi, rax
+    mov rsi, fs_io_buf
+    call ata_read_sector
+
+    mov rcx, 512
+    cmp rcx, r13
+    jbe .chunk_ok
+    mov rcx, r13
+.chunk_ok:
+    mov rsi, fs_io_buf
+    call print_bytes
+
+    sub r13, rcx
+    inc r14
+    jmp .read_loop
+
+.not_ready:
+    mov rsi, msg_fs_not_ready
+    call print_string
+    jmp .done
+.not_found:
+    mov rsi, msg_fs_not_found
+    call print_string
+
+.done:
+    mov rsi, msg_newline2
+    call print_string
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; fs_list: imprime nome e tamanho de cada arquivo no diretorio.
+fs_list:
+    push rbx
+    push rcx
+    push rdx
+
+    cmp byte [fs_ready], 0
+    je .not_ready
+
+    mov rbx, fs_directory
+    mov rcx, FS_MAX_FILES
+    xor rdx, rdx                       ; contador de arquivos encontrados
+.scan:
+    cmp byte [rbx], 0
+    je .next
+
+    push rcx
+    mov rsi, rbx
+    call print_string
+    mov rsi, msg_fs_ls_sep
+    call print_string
+    mov edx, [rbx + 28]           ; escrever em EDX ja zera a metade alta de RDX
+    call print_hex_qword
+    mov rsi, msg_newline2
+    call print_string
+    pop rcx
+    inc rdx
+
+.next:
+    add rbx, FS_ENTRY_SIZE
+    loop .scan
+
+    test rdx, rdx
+    jnz .done
+    mov rsi, msg_fs_ls_empty
+    call print_string
+    jmp .done
+
+.not_ready:
+    mov rsi, msg_fs_not_ready
+    call print_string
+
+.done:
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; fs_load_binary: RDI=nome, RSI=endereco destino. Copia os setores do
+; arquivo pra la (arredondado pra cima). Retorna AL=1 se achou o
+; arquivo (e copiou), AL=0 se nao achou (destino intocado).
+fs_load_binary:
+    push rbx
+    push r9
+    push r10
+    push r12
+    push r13
+    push r14
+
+    cmp byte [fs_ready], 0
+    je .not_found
+
+    call fs_find_entry
+    test rax, rax
+    jz .not_found
+    mov rbx, rax
+
+    mov r12, rsi                    ; endereco destino
+    mov r13d, [rbx + 24]              ; start_lba
+    mov r14d, [rbx + 28]               ; size_bytes
+
+    mov r9, r14
+    add r9, 511
+    shr r9, 9
+    test r9, r9
+    jnz .have_sectors
+    mov r9, 1
+.have_sectors:
+
+    xor r10, r10
+.load_loop:
+    mov rdi, r13
+    add rdi, r10
+    mov rax, r10
+    shl rax, 9
+    mov rsi, r12
+    add rsi, rax
+    call ata_read_sector
+    inc r10
+    cmp r10, r9
+    jb .load_loop
+
+    mov al, 1
+    jmp .done
+.not_found:
+    xor al, al
+.done:
+    pop r14
+    pop r13
+    pop r12
+    pop r10
+    pop r9
+    pop rbx
+    ret
+
+; fs_write_raw: RDI=nome, RSI=LBA de origem, RDX=quantidade de setores.
+; Copia setores BRUTOS de uma area do disco pra dentro do EVAFS, sem
+; olhar o conteudo -- serve pra "instalar" um binario que a Makefile ja
+; colocou num LBA fixo (ver comando "install").
+fs_write_raw:
+    push rbx
+    push r9
+    push r10
+    push r12
+    push r13
+    push r15
+
+    cmp byte [fs_ready], 0
+    je .not_ready
+
+    mov r12, rdi                     ; nome
+    mov r13, rsi                       ; LBA de origem
+    mov r9, rdx                         ; quantidade de setores
+
+    mov rdi, r12
+    call fs_find_entry
+    test rax, rax
+    jnz .have_slot
+    call fs_find_free_slot
+    test rax, rax
+    jz .full
+    inc dword [fs_file_count]
+.have_slot:
+    mov rbx, rax
+
+    mov r15d, [fs_next_free_lba]
+    xor r10, r10
+.copy_loop:
+    mov rdi, r13
+    add rdi, r10
+    mov rsi, fs_io_buf
+    call ata_read_sector
+
+    mov rdi, r15
+    add rdi, r10
+    mov rsi, fs_io_buf
+    call ata_write_sector
+
+    inc r10
+    cmp r10, r9
+    jb .copy_loop
+
+    mov rdi, rbx
+    mov rsi, r12
+    call str_copy_bounded
+    mov eax, r15d
+    mov [rbx + 24], eax
+    mov rax, r9
+    shl rax, 9
+    mov [rbx + 28], eax
+
+    add [fs_next_free_lba], r9d
+
+    call fs_sync
+
+    mov rsi, msg_fs_write_ok
+    call print_string
+    jmp .done
+
+.not_ready:
+    mov rsi, msg_fs_not_ready
+    call print_string
+    jmp .done
+.full:
+    mov rsi, msg_fs_full
+    call print_string
+
+.done:
+    pop r15
+    pop r13
+    pop r12
+    pop r10
+    pop r9
+    pop rbx
+    ret
+
 ; =======================================================================
 ; loader: le um "app" externo do disco (nao faz parte da imagem do
 ; kernel) pra um endereco fixo e roda em RING 3 (enter_usermode). O app
@@ -744,6 +1349,16 @@ shell_execute:
     test al, al
     jnz .do_run
 
+    mov rdi, cmd_run_prefix
+    call str_prefix
+    test al, al
+    jnz .do_run_named
+
+    mov rdi, cmd_install
+    call str_equal
+    test al, al
+    jnz .do_install
+
     mov rdi, cmd_user
     call str_equal
     test al, al
@@ -758,6 +1373,26 @@ shell_execute:
     call str_equal
     test al, al
     jnz .do_echo
+
+    mov rdi, cmd_format
+    call str_equal
+    test al, al
+    jnz .do_format
+
+    mov rdi, cmd_ls
+    call str_equal
+    test al, al
+    jnz .do_ls
+
+    mov rdi, cmd_write_prefix
+    call str_prefix
+    test al, al
+    jnz .do_write
+
+    mov rdi, cmd_cat_prefix
+    call str_prefix
+    test al, al
+    jnz .do_cat
 
     push rsi
     mov rsi, msg_unknown_cmd
@@ -824,6 +1459,41 @@ shell_execute:
     call load_and_run_app
     jmp .done
 
+.do_run_named:
+    ; RSI -> "<nome>" (ja avancado pelo str_prefix "run ")
+    cmp byte [rsi], 0
+    je .run_usage
+
+    mov rdi, rsi
+    mov rsi, APP_LOAD_ADDR
+    call fs_load_binary
+    test al, al
+    jz .run_not_found
+
+    mov rsi, msg_app_loaded_fs
+    call print_string
+    mov rdi, APP_LOAD_ADDR
+    call enter_usermode
+    mov rsi, msg_app_returned
+    call print_string
+    jmp .done
+
+.run_usage:
+    mov rsi, msg_run_usage
+    call print_string
+    jmp .done
+.run_not_found:
+    mov rsi, msg_fs_not_found
+    call print_string
+    jmp .done
+
+.do_install:
+    mov rdi, fs_hello_name
+    mov rsi, APP_LBA
+    mov rdx, APP_SECTORS
+    call fs_write_raw
+    jmp .done
+
 .do_user:
     call run_ring3_test
     jmp .done
@@ -834,6 +1504,62 @@ shell_execute:
 
 .do_echo:
     call run_ring3_echo_test
+    jmp .done
+
+.do_format:
+    call fs_format
+    jmp .done
+
+.do_ls:
+    call fs_list
+    jmp .done
+
+.do_write:
+    ; RSI -> "<nome> <conteudo...>" (ja avancado pelo str_prefix)
+    mov rdi, fs_name_buf
+    xor rcx, rcx
+.write_copy_name:
+    mov al, [rsi]
+    cmp al, ' '
+    je .write_name_done
+    test al, al
+    jz .write_name_done
+    cmp rcx, FS_NAME_MAX - 1
+    jae .write_name_done
+    mov [rdi + rcx], al
+    inc rcx
+    inc rsi
+    jmp .write_copy_name
+.write_name_done:
+    mov byte [rdi + rcx], 0
+
+    cmp rcx, 0
+    je .write_usage
+
+    cmp byte [rsi], ' '
+    jne .write_no_content
+    inc rsi
+.write_no_content:
+    mov rdi, fs_name_buf
+    call fs_write_file
+    jmp .done
+
+.write_usage:
+    mov rsi, msg_write_usage
+    call print_string
+    jmp .done
+
+.do_cat:
+    ; RSI -> "<nome>" (ja avancado pelo str_prefix)
+    cmp byte [rsi], 0
+    je .cat_usage
+    mov rdi, rsi
+    call fs_read_file
+    jmp .done
+
+.cat_usage:
+    mov rsi, msg_cat_usage
+    call print_string
 
 .done:
     ret
@@ -861,6 +1587,76 @@ str_equal:
 .done:
     pop rdi
     pop rsi
+    ret
+
+; str_prefix: RSI=linha, RDI=prefixo (terminado em 0). Se a linha comeca
+; com o prefixo, AL=1 e RSI passa a apontar pro que vem depois dele; se
+; nao bater, AL=0 e RSI fica como estava.
+str_prefix:
+    push rbx
+    mov rbx, rsi
+.loop:
+    mov al, [rdi]
+    test al, al
+    jz .matched
+    mov ah, [rbx]
+    cmp al, ah
+    jne .no_match
+    inc rdi
+    inc rbx
+    jmp .loop
+.matched:
+    mov rsi, rbx
+    mov al, 1
+    jmp .done
+.no_match:
+    xor al, al
+.done:
+    pop rbx
+    ret
+
+; str_copy_bounded: RDI=destino (FS_NAME_MAX+1 bytes), RSI=origem
+; (terminada em 0). Copia no maximo FS_NAME_MAX caracteres e sempre
+; termina o destino em 0.
+str_copy_bounded:
+    push rax
+    push rcx
+
+    xor rcx, rcx
+.loop:
+    cmp rcx, FS_NAME_MAX
+    jae .terminate
+    mov al, [rsi + rcx]
+    test al, al
+    jz .terminate
+    mov [rdi + rcx], al
+    inc rcx
+    jmp .loop
+.terminate:
+    mov byte [rdi + rcx], 0
+
+    pop rcx
+    pop rax
+    ret
+
+; print_bytes: RSI=ponteiro, RCX=quantidade de bytes. Imprime exatamente
+; RCX bytes crus (nao precisa ser terminado em 0).
+print_bytes:
+    push rax
+    push rcx
+    push rsi
+.loop:
+    test rcx, rcx
+    jz .done
+    mov al, [rsi]
+    call putchar
+    inc rsi
+    dec rcx
+    jmp .loop
+.done:
+    pop rsi
+    pop rcx
+    pop rax
     ret
 
 ; clear_screen: apaga o buffer de video inteiro e reseta o cursor pra (0,0)
@@ -1596,6 +2392,16 @@ app_input_ready    db 0
 command_pending     db 0
 timer_ticks dq 0
 
+; EVAFS: estado em memoria (ver comentario do modulo mais acima)
+fs_ready         db 0
+fs_next_free_lba dd 0
+fs_file_count    dd 0
+fs_name_buf: times (FS_NAME_MAX + 1) db 0   ; buffer temporario pro "write <nome> ..."
+
+align 16
+fs_io_buf: times 512 db 0
+fs_directory: times (FS_MAX_FILES * FS_ENTRY_SIZE) db 0
+
 msg_boot       db "EVA kernel: IDT + PIC + PIT + teclado + PMM ativos.", 10, 0
 msg_tick       db ".", 0
 msg_exception  db "[EXCECAO] ", 0
@@ -1620,7 +2426,7 @@ shell_len db 0
 
 msg_prompt      db "EVA> ", 0
 msg_unknown_cmd db "comando desconhecido: ", 0
-msg_help_text   db "comandos: help  mem  clear  about  disk  run  user  priv  echo", 10, 0
+msg_help_text   db "comandos: help mem clear about disk run run <nome> install", 10, "          user priv echo format ls cat <nome> write <nome> <texto>", 10, 0
 msg_about       db "EVA OS - kernel experimental em Assembly (modo longo 64-bit)", 10, 0
 msg_disk_ok     db "disk: leu o setor de boot (LBA 0) via ATA PIO -- assinatura 55 AA OK", 10, 0
 msg_disk_fail   db "disk: leu o setor, mas a assinatura de boot nao bateu", 10, 0
@@ -1630,6 +2436,18 @@ msg_app_returned db "run: app retornou pro shell.", 10, 0
 msg_ring3_returned db "user: syscall exit recebida, de volta ao shell (ring0).", 10, 0
 msg_priv_survived  db "priv: o kernel sobreviveu ao crash do programa ring3.", 10, 0
 msg_echo_returned  db "echo: syscall exit recebida, de volta ao shell.", 10, 0
+
+msg_fs_write_ok   db "write: arquivo salvo.", 10, 0
+msg_fs_not_ready  db "EVAFS nao formatado. Rode: format", 10, 0
+msg_fs_full       db "EVAFS: diretorio cheio (max 32 arquivos).", 10, 0
+msg_fs_not_found  db "arquivo nao encontrado.", 0
+msg_fs_ls_sep     db " -- ", 0
+msg_fs_ls_empty   db "(nenhum arquivo)", 10, 0
+msg_fs_formatted  db "EVAFS formatado.", 10, 0
+msg_write_usage   db "uso: write <nome> <conteudo>", 10, 0
+msg_cat_usage     db "uso: cat <nome>", 10, 0
+msg_run_usage     db "uso: run <nome> (ou so 'run' pro app legado em disco fixo)", 10, 0
+msg_app_loaded_fs db "run: app carregado do EVAFS, chamando...", 10, 0
 msg_syscall_cpl db "[syscall] CPL=0x", 0
 
 kernel_saved_rsp dq 0
@@ -1642,9 +2460,16 @@ cmd_clear db "clear", 0
 cmd_about db "about", 0
 cmd_disk  db "disk", 0
 cmd_run   db "run", 0
+cmd_run_prefix db "run ", 0
+cmd_install    db "install", 0
+fs_hello_name  db "hello", 0
 cmd_user  db "user", 0
 cmd_priv  db "priv", 0
 cmd_echo  db "echo", 0
+cmd_format db "format", 0
+cmd_ls     db "ls", 0
+cmd_write_prefix db "write ", 0
+cmd_cat_prefix   db "cat ", 0
 
 ; scancode (set 1, make code) -> ASCII. 0 = ignorado (tecla nao mapeada).
 align 8

@@ -12,9 +12,14 @@
 KERNEL_TEMP_ADDR  equ 0x10000    ; onde o kernel eh lido em modo real
 KERNEL_LOAD_ADDR  equ 0x100000   ; onde o kernel roda de fato (1 MiB)
 KERNEL_LBA        equ 17         ; stage2 ocupa LBA 1..16, kernel comeca em 17
-KERNEL_SECTORS    equ 128        ; 128 * 512 = 64 KiB reservados pro kernel
+KERNEL_SECTORS    equ 128        ; 128 * 512 = 64 KiB -- limite do buffer real-mode (1 segmento)
 KERNEL_SIZE       equ KERNEL_SECTORS * 512
 KERNEL_SIZE_QWORDS equ KERNEL_SIZE / 8
+
+; onde o mapa de memoria (BIOS E820) fica guardado, pro kernel ler depois.
+; precisa bater com os mesmos valores em kernel/kernel.asm.
+E820_COUNT_ADDR equ 0x4000       ; dword: quantidade de entradas
+E820_MAP_ADDR   equ 0x4008       ; array de entradas, 24 bytes cada
 
 ORG 0x8000
 
@@ -32,6 +37,8 @@ stage2_start:
     mov dl, [boot_drive]
     int 0x13
     jc disk_error
+
+    call detect_memory     ; ainda em modo real -- so a BIOS sabe o mapa de RAM
 
     ; habilita A20 (metodo rapido via porta 0x92)
     in al, 0x92
@@ -61,6 +68,37 @@ disk_error:
     cli
     hlt
     jmp .hang
+
+; Pergunta a BIOS (INT 15h, EAX=E820h) quais faixas de memoria fisica
+; existem e se estao usaveis. So funciona em modo real -- por isso roda
+; aqui, antes de entrar em modo protegido. Resultado guardado em
+; E820_MAP_ADDR (array de entradas de 24 bytes) e E820_COUNT_ADDR
+; (numero de entradas), pro kernel ler depois em modo longo.
+detect_memory:
+    xor ebx, ebx                  ; ebx=0 pede a primeira entrada
+    mov dword [E820_COUNT_ADDR], 0
+    mov di, E820_MAP_ADDR
+.loop:
+    mov dword [es:di + 20], 1     ; valor padrao caso a BIOS so escreva 20 bytes
+    mov eax, 0xE820
+    mov ecx, 24
+    mov edx, 0x534D4150            ; assinatura "SMAP"
+    int 0x15
+    jc .done                        ; CF setado = fim da lista (ou BIOS sem suporte)
+    cmp eax, 0x534D4150
+    jne .done
+
+    cmp ecx, 0
+    je .skip                         ; entrada de tamanho 0: ignora, nao avanca
+
+    inc dword [E820_COUNT_ADDR]
+    add di, 24
+
+.skip:
+    test ebx, ebx
+    jnz .loop                        ; ebx=0 -> essa era a ultima entrada
+.done:
+    ret
 
 boot_drive    db 0
 msg_disk_err  db "EVA stage2: ERRO AO LER KERNEL DO DISCO", 13, 10, 0
@@ -94,8 +132,12 @@ protected_mode_start:
     lgdt [gdt64_descriptor]
     jmp CODE64_SEG:long_mode_start
 
-; Identity-map os primeiros 16 MiB usando paginas de 2 MiB.
+; Identity-map o primeiro 1 GiB usando paginas de 2 MiB (512 entradas na
+; PD, o maximo que uma unica tabela de 4096 bytes comporta -- por isso
+; nao precisa de uma segunda PD nem mexer no layout de memoria baixa).
 ; PML4 em 0x1000, PDPT em 0x2000, PD em 0x3000 (memoria baixa livre).
+; Seguro mesmo se a maquina tiver menos RAM: o PMM (kernel) so libera
+; frames que o mapa E820 da BIOS realmente reportou como usaveis.
 setup_page_tables:
     mov edi, 0x1000
     xor eax, eax
@@ -107,7 +149,7 @@ setup_page_tables:
 
     mov edi, 0x3000
     mov eax, 0x83                      ; present, writable, page-size(2MiB)
-    mov ecx, 8                         ; 8 entradas = 16 MiB
+    mov ecx, 512                       ; 512 entradas = 1 GiB
 .fill_pd:
     mov [edi], eax
     add eax, 0x200000

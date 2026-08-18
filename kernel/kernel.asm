@@ -1,8 +1,8 @@
 ; EVA - kernel minimo.
 ; Carregado pelo stage2 num buffer temporario (0x10000) via BIOS em modo
 ; real, depois relocado para 0x100000 (1 MiB) em modo longo e executado.
-; Assumido: paginacao ja ativa com identity-map cobrindo pelo menos os
-; primeiros 16 MiB (feito pelo stage2), GDT de 64-bit ja carregada (a
+; Assumido: paginacao ja ativa com identity-map cobrindo pelo menos o
+; primeiro 1 GiB (feito pelo stage2), GDT de 64-bit ja carregada (a
 ; mesma montada pelo stage2 -- o selector de codigo 0x08 abaixo depende
 ; disso).
 
@@ -11,6 +11,20 @@ ORG 0x100000
 
 CODE64_SEG equ 0x08   ; selector do segmento de codigo na GDT64 do stage2
 ISR_COUNT  equ 34     ; vetores 0-31 (excecoes da CPU) + 32,33 (IRQ0, IRQ1)
+
+KERNEL_LOAD_ADDR  equ 0x100000
+KERNEL_IMAGE_SIZE equ 128 * 512   ; precisa bater com KERNEL_SECTORS do stage2.asm
+
+; onde o stage2 guardou o mapa de memoria da BIOS (E820) -- precisa bater
+; com os mesmos valores em boot/stage2.asm.
+E820_COUNT_ADDR equ 0x4000
+E820_MAP_ADDR   equ 0x4008
+
+FRAME_SIZE     equ 4096
+BITMAP_FRAMES  equ 262144  ; cobre o primeiro 1 GiB (o que o stage2 mapeou); bitmap = 32 KiB
+
+HEADER_SIZE equ 24   ; kmalloc: size(8) + used(8) + next(8)
+SHELL_BUF_SIZE equ 128
 
 kernel_entry:
     mov rsp, 0x90000
@@ -21,12 +35,698 @@ kernel_entry:
     call idt_install
     call pic_remap
     call pit_init
+    call pmm_init
+    call pmm_report
+
+    call pmm_test
+    call kmalloc_test
+
+    mov rsi, msg_prompt
+    call print_string
 
     sti                  ; a partir daqui IRQ0 (timer) e IRQ1 (teclado) disparam
 
 .idle:
     hlt                  ; dorme ate a proxima interrupcao
     jmp .idle
+
+; =======================================================================
+; PMM (gerenciador de memoria fisica) -- bitmap de frames de 4 KiB
+; =======================================================================
+
+; monta o bitmap a partir do mapa E820: tudo comeca "usado"; as faixas
+; usaveis (tipo 1) dentro de [1 MiB, 16 MiB) sao liberadas; a imagem do
+; kernel (que cai numa faixa usavel) e re-reservada por cima. Memoria
+; abaixo de 1 MiB fica sempre reservada (BIOS/bootloader/pilha/paginacao
+; vivem la) -- nao vale a pena rastrear frame a frame.
+pmm_init:
+    mov rdi, frame_bitmap
+    mov al, 0xFF
+    mov rcx, BITMAP_FRAMES / 8
+    rep stosb
+
+    xor r10, r10                    ; indice da entrada E820 atual
+    mov r11d, [E820_COUNT_ADDR]
+.entry_loop:
+    cmp r10, r11
+    jge .reserve_kernel
+
+    mov rax, r10
+    imul rax, 24
+    add rax, E820_MAP_ADDR
+    mov rbx, rax                     ; rbx = ponteiro pra entrada atual
+
+    mov eax, [rbx + 16]              ; type
+    cmp eax, 1
+    jne .next_entry                   ; so tipo 1 (usavel) nos interessa
+
+    mov rax, [rbx]                   ; base
+    mov rdx, [rbx + 8]                 ; length
+    add rdx, rax                        ; rdx = fim = base + length
+
+    cmp rax, 0x100000
+    jae .base_ok
+    mov rax, 0x100000                  ; nada abaixo de 1 MiB
+.base_ok:
+    cmp rdx, (BITMAP_FRAMES * FRAME_SIZE)
+    jbe .end_ok
+    mov rdx, (BITMAP_FRAMES * FRAME_SIZE)  ; nada alem dos 16 MiB mapeados
+.end_ok:
+    cmp rax, rdx
+    jae .next_entry                     ; faixa ficou vazia depois do recorte
+
+    call free_range
+
+.next_entry:
+    inc r10
+    jmp .entry_loop
+
+.reserve_kernel:
+    mov rax, KERNEL_LOAD_ADDR
+    mov rdx, KERNEL_LOAD_ADDR + KERNEL_IMAGE_SIZE
+    call mark_range_used
+    ret
+
+; free_range: RAX=inicio (bytes), RDX=fim (bytes, exclusivo) -> zera os bits
+; dos frames inteiramente cobertos (arredonda inicio pra cima, fim pra baixo).
+free_range:
+    push rax
+    push rbx
+    push rdx
+
+    add rax, FRAME_SIZE - 1
+    and rax, ~(FRAME_SIZE - 1)
+    and rdx, ~(FRAME_SIZE - 1)
+
+    mov rbx, rax
+.loop:
+    cmp rbx, rdx
+    jae .done
+    mov rax, rbx
+    shr rax, 12
+    call clear_bit
+    add rbx, FRAME_SIZE
+    jmp .loop
+.done:
+    pop rdx
+    pop rbx
+    pop rax
+    ret
+
+; mark_range_used: RAX=inicio, RDX=fim (exclusivo) -> seta os bits dos
+; frames tocados pela faixa (arredonda inicio pra baixo, fim pra cima --
+; prefere reservar de mais a reservar de menos).
+mark_range_used:
+    push rax
+    push rbx
+    push rdx
+
+    and rax, ~(FRAME_SIZE - 1)
+    add rdx, FRAME_SIZE - 1
+    and rdx, ~(FRAME_SIZE - 1)
+
+    mov rbx, rax
+.loop:
+    cmp rbx, rdx
+    jae .done
+    mov rax, rbx
+    shr rax, 12
+    call set_bit
+    add rbx, FRAME_SIZE
+    jmp .loop
+.done:
+    pop rdx
+    pop rbx
+    pop rax
+    ret
+
+; set_bit: RAX = indice do frame -> marca como usado (bit=1)
+set_bit:
+    push rax
+    push rbx
+    push rcx
+    mov rbx, rax
+    shr rbx, 3
+    and rax, 7
+    mov cl, al
+    mov al, 1
+    shl al, cl
+    or [frame_bitmap + rbx], al
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; clear_bit: RAX = indice do frame -> marca como livre (bit=0)
+clear_bit:
+    push rax
+    push rbx
+    push rcx
+    mov rbx, rax
+    shr rbx, 3
+    and rax, 7
+    mov cl, al
+    mov al, 1
+    shl al, cl
+    not al
+    and [frame_bitmap + rbx], al
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; alloc_frame: retorna RAX = endereco fisico do frame alocado (marcando-o
+; como usado), ou 0 se nao sobrou nenhum frame livre.
+alloc_frame:
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+
+    xor rbx, rbx
+.scan:
+    cmp rbx, BITMAP_FRAMES
+    jae .out_of_memory
+
+    mov rax, rbx
+    mov rcx, rax
+    shr rax, 3
+    and rcx, 7
+    mov sil, [frame_bitmap + rax]
+    mov dl, 1
+    shl dl, cl
+    test sil, dl
+    jz .found
+
+    inc rbx
+    jmp .scan
+
+.found:
+    mov rax, rbx
+    call set_bit
+    mov rax, rbx
+    shl rax, 12
+    jmp .done
+
+.out_of_memory:
+    xor rax, rax
+
+.done:
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; free_frame: RAX = endereco fisico (alinhado a 4096) -> marca como livre
+free_frame:
+    push rax
+    shr rax, 12
+    call clear_bit
+    pop rax
+    ret
+
+; pmm_report: conta frames livres no bitmap e imprime o total
+pmm_report:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push r10
+
+    xor rbx, rbx           ; contador de frames livres
+    xor r10, r10             ; indice do frame atual
+.scan:
+    cmp r10, BITMAP_FRAMES
+    jae .print
+
+    mov rax, r10
+    mov rdx, r10
+    shr rax, 3
+    and rdx, 7
+    mov cl, dl
+    mov al, [frame_bitmap + rax]
+    mov dl, 1
+    shl dl, cl
+    test al, dl
+    jnz .used
+    inc rbx
+.used:
+    inc r10
+    jmp .scan
+
+.print:
+    mov rsi, msg_pmm_free
+    call print_string
+    mov rdx, rbx
+    call print_hex_qword
+    mov rsi, msg_pmm_frames
+    call print_string
+
+    pop r10
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; pmm_test: aloca 3 frames, mostra os enderecos, libera o do meio e aloca
+; de novo -- o novo endereco deve ser igual ao que acabou de ser liberado
+; (prova de que o allocator reaproveita frames livres).
+pmm_test:
+    call alloc_frame
+    mov r12, rax
+    call alloc_frame
+    mov r13, rax
+    call alloc_frame
+    mov r14, rax
+
+    mov rsi, msg_alloc3
+    call print_string
+    mov rdx, r12
+    call print_hex_qword
+    mov rsi, msg_space
+    call print_string
+    mov rdx, r13
+    call print_hex_qword
+    mov rsi, msg_space
+    call print_string
+    mov rdx, r14
+    call print_hex_qword
+    mov rsi, msg_newline2
+    call print_string
+
+    mov rax, r13
+    call free_frame
+    call alloc_frame
+
+    mov rsi, msg_realloc
+    call print_string
+    mov rdx, rax
+    call print_hex_qword
+    mov rsi, msg_newline2
+    call print_string
+    ret
+
+; =======================================================================
+; kmalloc/kfree: alocador de heap simples sobre o PMM.
+;
+; Lista encadeada de blocos: cada bloco tem um header (size, used, next)
+; seguido do espaco util. A heap cresce um frame de 4 KiB por vez (via
+; alloc_frame), inserido no INICIO da lista -- os blocos nao precisam
+; ser fisicamente contiguos entre si, so o header/next precisa ser valido.
+;
+; Limitacao conhecida: uma unica alocacao nao pode passar de
+; FRAME_SIZE - HEADER_SIZE (4072 bytes), porque cada bloco vem de um
+; unico frame; nao ha fusao (coalescing) de blocos livres vizinhos ainda,
+; entao uso intenso de alloc/free pequenos pode fragmentar a heap.
+; =======================================================================
+
+heap_head dq 0
+
+; kmalloc: RDI = tamanho desejado (bytes). Retorna RAX = ponteiro pro
+; espaco util, ou 0 se o pedido for grande demais ou faltar memoria fisica.
+kmalloc:
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+
+    add rdi, 15
+    and rdi, ~15                        ; arredonda pra multiplo de 16
+
+    cmp rdi, FRAME_SIZE - HEADER_SIZE
+    ja .fail
+
+    mov rbx, [heap_head]
+.search:
+    test rbx, rbx
+    jz .grow_heap
+
+    cmp qword [rbx + 8], 0               ; used?
+    jne .next_block
+    cmp qword [rbx], rdi                  ; size >= pedido?
+    jae .use_block
+
+.next_block:
+    mov rbx, [rbx + 16]
+    jmp .search
+
+.grow_heap:
+    call alloc_frame
+    test rax, rax
+    jz .fail
+
+    mov qword [rax], FRAME_SIZE - HEADER_SIZE
+    mov qword [rax + 8], 0
+    mov rcx, [heap_head]
+    mov [rax + 16], rcx
+    mov [heap_head], rax
+    mov rbx, rax                          ; bloco novo, garantidamente cabe
+
+.use_block:
+    mov rax, [rbx]                        ; tamanho do bloco escolhido
+    sub rax, rdi
+    cmp rax, HEADER_SIZE + 16              ; sobra o bastante pra valer dividir?
+    jb .no_split
+
+    mov rcx, rbx
+    add rcx, HEADER_SIZE
+    add rcx, rdi                            ; rcx = header do novo bloco livre
+    mov rdx, rax
+    sub rdx, HEADER_SIZE
+    mov [rcx], rdx
+    mov qword [rcx + 8], 0
+    mov rdx, [rbx + 16]
+    mov [rcx + 16], rdx
+    mov [rbx + 16], rcx
+    mov [rbx], rdi                           ; bloco alocado fica do tamanho pedido
+
+.no_split:
+    mov qword [rbx + 8], 1                    ; used = 1
+    mov rax, rbx
+    add rax, HEADER_SIZE
+    jmp .done
+
+.fail:
+    xor rax, rax
+
+.done:
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    ret
+
+; kfree: RDI = ponteiro devolvido por kmalloc -> marca o bloco como livre.
+; (sem fusao com vizinhos ainda -- ver limitacao no comentario acima)
+kfree:
+    test rdi, rdi
+    jz .done
+    sub rdi, HEADER_SIZE
+    mov qword [rdi + 8], 0
+.done:
+    ret
+
+; kmalloc_test: aloca 3 blocos de 64 bytes, libera o do meio, aloca de
+; novo -- como o pedido tem o mesmo tamanho exato, nao ha split, entao o
+; endereco devolvido deve ser identico ao que acabou de ser liberado.
+kmalloc_test:
+    mov rdi, 64
+    call kmalloc
+    mov r12, rax
+    mov rdi, 64
+    call kmalloc
+    mov r13, rax
+    mov rdi, 64
+    call kmalloc
+    mov r14, rax
+
+    mov rsi, msg_kmalloc3
+    call print_string
+    mov rdx, r12
+    call print_hex_qword
+    mov rsi, msg_space
+    call print_string
+    mov rdx, r13
+    call print_hex_qword
+    mov rsi, msg_space
+    call print_string
+    mov rdx, r14
+    call print_hex_qword
+    mov rsi, msg_newline2
+    call print_string
+
+    mov rdi, r13
+    call kfree
+    mov rdi, 64
+    call kmalloc
+
+    mov rsi, msg_krealloc
+    call print_string
+    mov rdx, rax
+    call print_hex_qword
+    mov rsi, msg_newline2
+    call print_string
+    ret
+
+; =======================================================================
+; ATA PIO (barramento primario, drive master) -- leitura de setor por
+; polling, sem IRQ. E o unico jeito do KERNEL (em modo longo) ler disco:
+; a BIOS (que o bootloader usa) so existe em modo real.
+; =======================================================================
+
+; ata_read_sector: RDI = LBA (28 bits), RSI = buffer destino (512 bytes).
+; Nao trata erro de forma robusta ainda: se ERR ficar setado, desiste e
+; retorna sem preencher o buffer.
+ata_read_sector:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rdi
+
+    mov rbx, rdi
+
+    mov dx, 0x1F6
+    mov rax, rbx
+    shr rax, 24
+    and al, 0x0F
+    or al, 0xE0                  ; modo LBA, drive master, bits 24-27 do LBA
+    out dx, al
+
+    mov dx, 0x1F2
+    mov al, 1
+    out dx, al                    ; 1 setor
+
+    mov dx, 0x1F3
+    mov al, bl
+    out dx, al                     ; LBA 0-7
+
+    mov dx, 0x1F4
+    mov rax, rbx
+    shr rax, 8
+    out dx, al                      ; LBA 8-15
+
+    mov dx, 0x1F5
+    mov rax, rbx
+    shr rax, 16
+    out dx, al                       ; LBA 16-23
+
+    mov dx, 0x1F7
+    mov al, 0x20                      ; comando READ SECTORS
+    out dx, al
+
+.wait:
+    in al, dx
+    test al, 0x80                      ; BSY?
+    jnz .wait
+    test al, 0x08                       ; DRQ?
+    jz .wait
+    test al, 0x01                        ; ERR?
+    jnz .done
+
+    mov dx, 0x1F0
+    mov rdi, rsi
+    mov rcx, 256                          ; 256 words = 512 bytes
+.read_loop:
+    in ax, dx
+    mov [rdi], ax
+    add rdi, 2
+    loop .read_loop
+
+.done:
+    pop rdi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; =======================================================================
+; loader: le um "app" externo do disco (nao faz parte da imagem do
+; kernel) pra um endereco fixo e da um CALL nele. O app precisa terminar
+; com "ret" pra devolver o controle pro shell -- e so codigo de maquina
+; cru, sem acesso as funcoes do kernel (binario separado, sem link).
+; =======================================================================
+
+APP_LBA        equ 145        ; logo depois da area reservada pro kernel
+APP_SECTORS    equ 8
+APP_LOAD_ADDR  equ 0x200000   ; 2 MiB -- dentro do 1 GiB identity-mapped
+
+load_and_run_app:
+    mov r12, APP_LBA
+    mov r13, APP_LOAD_ADDR
+    mov r14, APP_SECTORS
+.load_loop:
+    mov rdi, r12
+    mov rsi, r13
+    call ata_read_sector
+    inc r12
+    add r13, 512
+    dec r14
+    jnz .load_loop
+
+    mov rsi, msg_app_loaded
+    call print_string
+
+    call APP_LOAD_ADDR
+
+    mov rsi, msg_app_returned
+    call print_string
+    ret
+
+; =======================================================================
+; shell: interpreta a linha acumulada pelo irq1_handler no Enter.
+; =======================================================================
+
+; shell_execute: RSI = ponteiro pra linha digitada (terminada em 0)
+shell_execute:
+    cmp byte [rsi], 0
+    je .done                    ; linha vazia, nao faz nada
+
+    mov rdi, cmd_help
+    call str_equal
+    test al, al
+    jnz .do_help
+
+    mov rdi, cmd_mem
+    call str_equal
+    test al, al
+    jnz .do_mem
+
+    mov rdi, cmd_clear
+    call str_equal
+    test al, al
+    jnz .do_clear
+
+    mov rdi, cmd_about
+    call str_equal
+    test al, al
+    jnz .do_about
+
+    mov rdi, cmd_disk
+    call str_equal
+    test al, al
+    jnz .do_disk
+
+    mov rdi, cmd_run
+    call str_equal
+    test al, al
+    jnz .do_run
+
+    push rsi
+    mov rsi, msg_unknown_cmd
+    call print_string
+    pop rsi
+    call print_string
+    mov rsi, msg_newline2
+    call print_string
+    jmp .done
+
+.do_help:
+    mov rsi, msg_help_text
+    call print_string
+    jmp .done
+.do_mem:
+    call pmm_report
+    jmp .done
+.do_clear:
+    call clear_screen
+    jmp .done
+.do_about:
+    mov rsi, msg_about
+    call print_string
+    jmp .done
+
+.do_disk:
+    mov rdi, 512
+    call kmalloc
+    test rax, rax
+    jz .disk_nomem
+    mov r12, rax
+
+    xor rdi, rdi                 ; LBA 0 -- o proprio setor de boot
+    mov rsi, r12
+    call ata_read_sector
+
+    mov al, [r12 + 510]
+    cmp al, 0x55
+    jne .disk_fail
+    mov al, [r12 + 511]
+    cmp al, 0xAA
+    jne .disk_fail
+
+    mov rsi, msg_disk_ok
+    call print_string
+    jmp .disk_free
+
+.disk_fail:
+    mov rsi, msg_disk_fail
+    call print_string
+    jmp .disk_free
+
+.disk_free:
+    mov rdi, r12
+    call kfree
+    jmp .done
+
+.disk_nomem:
+    mov rsi, msg_disk_nomem
+    call print_string
+    jmp .done
+
+.do_run:
+    call load_and_run_app
+
+.done:
+    ret
+
+; str_equal: RSI, RDI = ponteiros pra strings terminadas em 0.
+; Retorna AL = 1 se iguais, 0 se diferentes.
+str_equal:
+    push rsi
+    push rdi
+.loop:
+    mov al, [rsi]
+    mov ah, [rdi]
+    cmp al, ah
+    jne .not_equal
+    test al, al
+    jz .equal
+    inc rsi
+    inc rdi
+    jmp .loop
+.equal:
+    mov al, 1
+    jmp .done
+.not_equal:
+    xor al, al
+.done:
+    pop rdi
+    pop rsi
+    ret
+
+; clear_screen: apaga o buffer de video inteiro e reseta o cursor pra (0,0)
+clear_screen:
+    push rax
+    push rcx
+    push rdi
+
+    mov rdi, 0xB8000
+    mov rax, 0x0F200F200F200F20
+    mov rcx, (80 * 25 * 2) / 8
+    rep stosq
+
+    mov qword [cursor_row], 0
+    mov qword [cursor_col], 0
+
+    pop rdi
+    pop rcx
+    pop rax
+    ret
 
 ; =======================================================================
 ; IDT
@@ -299,7 +999,50 @@ irq1_handler:
 .maybe_print:
     test al, al
     jz .done
+
+    cmp al, 8                     ; backspace
+    je .do_backspace
+    cmp al, 10                     ; enter
+    je .do_enter
+
+    movzx rcx, byte [shell_len]
+    cmp rcx, SHELL_BUF_SIZE - 1
+    jae .done                        ; buffer cheio, ignora a tecla
+    mov [shell_buf + rcx], al
+    inc byte [shell_len]
     call putchar
+    jmp .done
+
+.do_backspace:
+    cmp byte [shell_len], 0
+    je .done
+    dec byte [shell_len]
+    cmp qword [cursor_col], 0
+    je .done                          ; simplificacao: nao apaga voltando de linha
+    dec qword [cursor_col]
+    mov rax, [cursor_row]
+    mov rbx, 80
+    mul rbx
+    add rax, [cursor_col]
+    shl rax, 1
+    mov rdi, 0xB8000
+    add rdi, rax
+    mov byte [rdi], ' '
+    mov byte [rdi + 1], 0x0F
+    jmp .done
+
+.do_enter:
+    call putchar                       ; ecoa a quebra de linha (AL ainda = 10)
+
+    movzx rcx, byte [shell_len]
+    mov byte [shell_buf + rcx], 0        ; termina a string digitada
+
+    mov rsi, shell_buf
+    call shell_execute
+
+    mov byte [shell_len], 0
+    mov rsi, msg_prompt
+    call print_string
     jmp .done
 
 .shift_down:
@@ -444,6 +1187,32 @@ print_hex_byte:
     pop rax
     ret
 
+; print_hex_qword: RDX = valor de 64 bits, imprime os 16 digitos hex
+print_hex_qword:
+    push rax
+    push rcx
+    push r8
+    push r9
+
+    mov r8, rdx
+    mov r9, 60             ; deslocamento do nibble mais significativo
+.loop:
+    mov rax, r8
+    mov rcx, r9
+    shr rax, cl
+    and al, 0x0F
+    call hex_nibble_to_ascii
+    call putchar
+
+    sub r9, 4
+    jns .loop
+
+    pop r9
+    pop r8
+    pop rcx
+    pop rax
+    ret
+
 ; hex_nibble_to_ascii: AL (0-15) -> AL = digito ASCII
 hex_nibble_to_ascii:
     cmp al, 10
@@ -463,7 +1232,7 @@ cursor_col dq 0
 shift_pressed db 0
 timer_ticks dq 0
 
-msg_boot       db "EVA kernel: IDT + PIC + PIT + teclado ativos. Um marcador por segundo; digite algo:", 10, 0
+msg_boot       db "EVA kernel: IDT + PIC + PIT + teclado + PMM ativos.", 10, 0
 msg_tick       db ".", 0
 msg_exception  db "[EXCECAO] ", 0
 msg_unknown_name db "(reservado/desconhecido)", 0
@@ -471,6 +1240,35 @@ msg_vector     db " vetor=0x", 0
 msg_errcode    db " erro=0x", 0
 msg_halted     db " -- CPU parada.", 10, 0
 msg_no_return  db "ERRO INTERNO: retornou da excecao (nao deveria acontecer)", 10, 0
+
+msg_pmm_free   db "PMM: frames livres = 0x", 0
+msg_pmm_frames db " (de 262144, 1 GiB rastreado)", 10, 0
+msg_alloc3     db "PMM: alocados 3 frames: ", 0
+msg_space      db " ", 0
+msg_newline2   db 10, 0
+msg_realloc    db "PMM: liberou o do meio e alocou de novo -> ", 0
+msg_kmalloc3   db "kmalloc: alocados 3 blocos de 64 bytes: ", 0
+msg_krealloc   db "kmalloc: liberou o do meio e alocou de novo -> ", 0
+
+shell_buf: times SHELL_BUF_SIZE db 0
+shell_len db 0
+
+msg_prompt      db "EVA> ", 0
+msg_unknown_cmd db "comando desconhecido: ", 0
+msg_help_text   db "comandos: help  mem  clear  about  disk  run", 10, 0
+msg_about       db "EVA OS - kernel experimental em Assembly (modo longo 64-bit)", 10, 0
+msg_disk_ok     db "disk: leu o setor de boot (LBA 0) via ATA PIO -- assinatura 55 AA OK", 10, 0
+msg_disk_fail   db "disk: leu o setor, mas a assinatura de boot nao bateu", 10, 0
+msg_disk_nomem  db "disk: sem memoria pro buffer de leitura", 10, 0
+msg_app_loaded  db "run: app carregado do disco (LBA 145), chamando...", 10, 0
+msg_app_returned db "run: app retornou pro shell.", 10, 0
+
+cmd_help  db "help", 0
+cmd_mem   db "mem", 0
+cmd_clear db "clear", 0
+cmd_about db "about", 0
+cmd_disk  db "disk", 0
+cmd_run   db "run", 0
 
 ; scancode (set 1, make code) -> ASCII. 0 = ignorado (tecla nao mapeada).
 align 8
@@ -537,5 +1335,10 @@ name_vc  db "VMM Communication", 0
 name_sx  db "Security Exception", 0
 name_res db "Reservado", 0
 
+; bitmap do PMM: 1 bit por frame de 4 KiB, BITMAP_FRAMES/8 bytes
+align 8
+frame_bitmap:
+    times (BITMAP_FRAMES / 8) db 0
+
 ; KERNEL_SECTORS (stage2.asm) * 512 -- manter em sincronia com stage2.asm
-times (128 * 512) - ($ - $$) db 0
+times KERNEL_IMAGE_SIZE - ($ - $$) db 0

@@ -39,6 +39,21 @@ USER_STACK_TOP equ 0x300000   ; 3 MiB -- dentro do 1 GiB identity-mapped
 SYSCALL_STACK_SIZE equ 8192   ; pilha DEDICADA pra TSS.RSP0 (nao pode ser a
                                 ; mesma que o codigo que entra em ring3 usa)
 
+; multitarefa (V1, escopo minimo): numero FIXO de tarefas, criadas so pelo
+; comando "spawn", round-robin puro via timer (IRQ0), sem prioridade, sem
+; criacao dinamica. Cada tarefa precisa de PILHA DE KERNEL propria (nao pode
+; compartilhar a syscall_stack -- se a tarefa A for trocada no meio de uma
+; syscall, a tarefa B nao pode pisar nos frames dela) e de PILHA DE USUARIO
+; propria (nao pode compartilhar USER_STACK_TOP). O CODIGO das tarefas de
+; demo fica embutido no kernel (todo endereco identity-mapped ja e
+; acessivel de ring3), so a pilha precisa de um endereco exclusivo por
+; tarefa.
+TASK_COUNT       equ 2
+TASK_KSTACK_SIZE equ 4096
+TASK_USTACK_BASE equ 0x400000  ; 4 MiB -- livre (nao colide com kernel,
+                                 ; area do app loader nem USER_STACK_TOP)
+TASK_USTACK_SIZE equ 0x10000   ; 64 KiB de pilha de usuario por tarefa
+
 ; EVAFS: sistema de arquivos proprio, bem simples de proposito -- sem
 ; subdiretorios, sem fragmentacao (alocacao contigua via ponteiro que so
 ; cresce, nunca reaproveita espaco de arquivo apagado/sobrescrito).
@@ -163,6 +178,12 @@ pmm_init:
 
     mov rax, 0x2F0000
     mov rdx, 0x300000
+    call mark_range_used
+
+    ; pilhas de usuario das tarefas da multitarefa (TASK_USTACK_BASE em
+    ; diante, TASK_COUNT * TASK_USTACK_SIZE bytes)
+    mov rax, TASK_USTACK_BASE
+    mov rdx, TASK_USTACK_BASE + (TASK_COUNT * TASK_USTACK_SIZE)
     call mark_range_used
     ret
 
@@ -1374,6 +1395,11 @@ shell_execute:
     test al, al
     jnz .do_echo
 
+    mov rdi, cmd_spawn
+    call str_equal
+    test al, al
+    jnz .do_spawn
+
     mov rdi, cmd_format
     call str_equal
     test al, al
@@ -1504,6 +1530,14 @@ shell_execute:
 
 .do_echo:
     call run_ring3_echo_test
+    jmp .done
+
+.do_spawn:
+    mov rsi, msg_spawn_start
+    call print_string
+    call spawn_and_wait
+    mov rsi, msg_spawn_done
+    call print_string
     jmp .done
 
 .do_format:
@@ -1936,6 +1970,31 @@ isr_irq_common_stub:
     mov al, 0x20                  ; EOI (End Of Interrupt) pro PIC master
     out 0x20, al
 
+    ; gancho do escalonador: SO depois do EOI (senao a linha do PIC fica
+    ; travada pro resto da sessao -- ja aconteceu, ver historico) e SO em
+    ; tick de timer (vetor 32), nunca em IRQ1 -- quem decide a troca de
+    ; tarefa e o timer, nao o teclado.
+    cmp byte [multitasking_active], 0
+    je task_resume_common
+    cmp qword [rsp + 15 * 8], 32
+    jne task_resume_common
+    jmp scheduler_switch           ; NUNCA "call": scheduler_switch troca de
+                                     ; pilha (RSP passa a apontar pra tarefa
+                                     ; escolhida) e sai via "jmp
+                                     ; task_resume_common" -- um "call" aqui
+                                     ; empilharia o retorno na pilha da
+                                     ; tarefa ATUAL bem antes dela ser salva,
+                                     ; corrompendo o frame que devera
+                                     ; retomar-la depois (bug real, achado
+                                     ; testando: CPU preso a 101% depois do
+                                     ; primeiro tick, nunca trocava pra B)
+
+; task_resume_common: desempilha os 15 regs de proposito geral + descarta
+; vetor/errcode + iretq. Usado tanto pra retomar o fluxo normal (nao-
+; multitarefa) quanto, no modo multitarefa, pra retomar QUALQUER tarefa cujo
+; RSP tenha sido colocado aqui em cima por scheduler_switch/task_spawn --
+; o pop+iretq nao sabe nem precisa saber de quem e a pilha.
+task_resume_common:
     pop r15
     pop r14
     pop r13
@@ -2087,11 +2146,14 @@ isr_syscall_stub:
     push r14
     push r15
 
-    ; syscall 2 (read_char) pode ser chamada varias vezes seguidas (um
-    ; app lendo tecla por tecla) -- pula o print de CPL pra nao spammar
-    ; a tela; ele ja foi provado nas outras duas syscalls.
+    ; syscall 2 (read_char) e 3 (write_char) podem ser chamadas varias
+    ; vezes seguidas (leitura tecla-a-tecla, ou o loop apertado das
+    ; tarefas de demo da multitarefa) -- pulam o print de CPL pra nao
+    ; spammar a tela; ja foi provado nas outras syscalls.
     cmp rax, 2
     je .sys_read_char
+    cmp rax, 3
+    je .sys_write_char
 
     ; prova de que realmente estamos voltando de ring3: imprime o CPL
     ; (bits 0-1 do CS salvo pela CPU) antes de fazer qualquer outra
@@ -2113,12 +2175,20 @@ isr_syscall_stub:
     je .sys_exit
     cmp rax, 1
     je .sys_write
-    jmp .sys_return
+    jmp task_resume_common
 
 .sys_write:
     mov rsi, rdi
     call print_string
-    jmp .sys_return
+    jmp task_resume_common
+
+; sys_write_char: RDI (byte baixo) = 1 caractere, sem print de CPL, sem
+; passar por print_string -- usado pelo loop apertado das tarefas de demo
+; da multitarefa, pra minimizar o tempo gasto dentro da syscall.
+.sys_write_char:
+    mov al, dil
+    call putchar
+    jmp task_resume_common
 
 ; sys_read_char: bloqueia (com IF=1, via hlt) ate o irq1_handler
 ; depositar um caractere no "correio" abaixo, e devolve ele em RAX.
@@ -2135,10 +2205,17 @@ isr_syscall_stub:
     mov byte [app_reading_input], 0
 
     movzx rax, byte [app_input_char]
-    mov [rsp + 14 * 8], rax          ; sobrescreve o RAX que .sys_return vai restaurar
-    jmp .sys_return
+    mov [rsp + 14 * 8], rax          ; sobrescreve o RAX que task_resume_common vai restaurar
+    jmp task_resume_common
 
 .sys_exit:
+    ; fora da multitarefa: mesmo truque de sempre (troca de pilha + RET
+    ; manual, "retorna" de enter_usermode pro chamador). Dentro dela: a
+    ; tarefa nao tem um "chamador" individual pra voltar -- marca ela como
+    ; morta e deixa o escalonador escolher quem roda a seguir (ou devolver
+    ; o controle pro comando "spawn" se essa era a ultima viva).
+    cmp byte [multitasking_active], 0
+    jne .sys_exit_task
     mov rsp, [kernel_saved_rsp]
     sti                              ; entrar aqui (interrupt gate) desligou IF; como
                                        ; esse "retorno" e um RET manual (nao iretq), tem
@@ -2146,25 +2223,11 @@ isr_syscall_stub:
                                        ; pra interrupcoes pro resto da sessao
     ret                              ; "retorna" de enter_usermode pro chamador
 
-.sys_return:
-    pop r15
-    pop r14
-    pop r13
-    pop r12
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rbp
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rbx
-    pop rax
-
-    add rsp, 16                       ; descarta vetor+errcode empilhados pelo isr128
-    iretq
+.sys_exit_task:
+    jmp scheduler_kill_and_switch   ; NUNCA "call" -- mesmo motivo do
+                                      ; scheduler_switch (ela mesma desvia
+                                      ; pra task_resume_common ou faz o RET
+                                      ; manual pro chamador de spawn_and_wait)
 
 ; tss_init: zera a TSS, seta RSP0 pra uma pilha DEDICADA (nao pode ser
 ; a mesma que o codigo que chama enter_usermode ja esta usando -- senao
@@ -2208,6 +2271,224 @@ enter_usermode:
     push qword (USER_CODE_SEL | 3)
     push rdi
     iretq
+
+; =======================================================================
+; multitarefa (V1): 2 tarefas fixas, criadas so pelo comando "spawn",
+; round-robin puro disparado pelo timer (IRQ0). Ver isr_irq_common_stub
+; (gancho depois do EOI) e o topo do arquivo (constantes TASK_*).
+;
+; O truque central: um "frame de interrupcao" (15 regs de proposito geral
+; + vetor/errcode + RIP/CS/RFLAGS/RSP/SS empilhados pela CPU) e identico
+; nas duas pontas -- tanto quando task_spawn MONTA um pela primeira vez
+; quanto quando uma interrupcao de verdade o produz. Trocar de tarefa e
+; so trocar QUAL pilha o RSP aponta antes de rodar o pop+iretq generico
+; (task_resume_common, em isr_irq_common_stub); TSS.RSP0 tem que
+; acompanhar a troca (e onde a CPU empilha o PROXIMO frame dessa tarefa).
+; =======================================================================
+
+; task_spawn: RDI=indice da tarefa, RSI=ponto de entrada (ring3),
+; RDX=topo da pilha de usuario dela. Monta o frame falso descrito acima
+; no topo da pilha de KERNEL dedicada da tarefa.
+task_spawn:
+    push rax
+    push rbx
+    push rcx
+
+    mov rax, rdi
+    mov rbx, [task_kstack_top + rax * 8]
+
+    sub rbx, 8
+    mov qword [rbx], (USER_DATA_SEL | 3)   ; SS
+    sub rbx, 8
+    mov [rbx], rdx                          ; RSP do usuario
+    sub rbx, 8
+    mov qword [rbx], 0x202                   ; RFLAGS (IF=1; bit1 e sempre 1 por hardware)
+    sub rbx, 8
+    mov qword [rbx], (USER_CODE_SEL | 3)      ; CS
+    sub rbx, 8
+    mov [rbx], rsi                             ; RIP = ponto de entrada
+
+    sub rbx, 8
+    mov qword [rbx], 0                          ; espaco do errcode (nunca lido, so pulado)
+    sub rbx, 8
+    mov qword [rbx], 0                           ; espaco do vetor (idem)
+
+    mov rcx, 15                                   ; 15 regs GP, todos zerados
+.zero_regs:
+    sub rbx, 8
+    mov qword [rbx], 0
+    loop .zero_regs
+
+    mov [task_rsp + rax * 8], rbx
+    mov byte [task_state + rax], 1
+
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; scheduler_switch: alcancada via JMP (nunca CALL -- ver isr_irq_common_stub)
+; num tick de timer com multitarefa ativa. A tarefa atual esta "presa" no
+; meio de uma interrupcao (RSP aponta pro frame dela); guarda esse RSP e
+; escolhe a proxima tarefa VIVA em round-robin (pode ser ela mesma, se so
+; sobrou uma), e desvia pra task_resume_common (nao "ret" -- nesse ponto
+; RSP ja aponta pra pilha de outra tarefa, nao ha endereco de retorno
+; valido la). So clobbers RAX/RBX/RCX de proposito: task_resume_common vai
+; jogar tudo fora no pop logo em seguida, nao ha nada pra preservar.
+scheduler_switch:
+    mov cl, [current_task]
+    movzx rbx, cl
+    mov [task_rsp + rbx * 8], rsp
+
+    mov al, cl
+.find_next:
+    inc al
+    cmp al, TASK_COUNT
+    jl .check
+    xor al, al
+.check:
+    movzx rbx, al
+    cmp byte [task_state + rbx], 1
+    je .found
+    cmp al, cl
+    je .none_alive
+    jmp .find_next
+.found:
+    mov [current_task], al
+    movzx rbx, al
+    mov rsp, [task_rsp + rbx * 8]
+    mov rax, [task_kstack_top + rbx * 8]
+    mov [TSS_ADDR + 4], rax
+    jmp task_resume_common
+
+.none_alive:
+    ; nao deveria acontecer por aqui (a tarefa atual, no minimo, ainda
+    ; esta viva) -- mas se acontecer, trata como "acabou tudo", igual o
+    ; scheduler_kill_and_switch. Este "ret" e valido: RSP acabou de
+    ; voltar pra pilha do KERNEL (kernel_saved_rsp), que tem um endereco
+    ; de retorno de verdade la (o "call spawn_and_wait" original).
+    mov byte [multitasking_active], 0
+    mov rsp, [kernel_saved_rsp]
+    sti
+    ret
+
+; scheduler_kill_and_switch: alcancada via JMP (nunca CALL -- mesmo motivo
+; do scheduler_switch) pela syscall exit (ou por uma excecao) quando a
+; tarefa atual esta terminando. NAO salva o RSP dela (nao vai ser
+; retomada); so marca como morta e escolhe a proxima viva. Se nao sobrar
+; nenhuma: desativa a multitarefa e devolve o controle pro chamador de
+; spawn_and_wait via "RET manual" (mesmo truque de sempre -- troca de
+; pilha porque a entrada aqui foi via gate de interrupcao, que desligou
+; IF, entao precisa de "sti" explicito antes do ret).
+scheduler_kill_and_switch:
+    mov al, [current_task]
+    movzx rbx, al
+    mov byte [task_state + rbx], 0
+    mov cl, al
+
+.find_next:
+    inc al
+    cmp al, TASK_COUNT
+    jl .check
+    xor al, al
+.check:
+    movzx rbx, al
+    cmp byte [task_state + rbx], 1
+    je .found
+    cmp al, cl
+    je .none_alive
+    jmp .find_next
+.found:
+    mov [current_task], al
+    movzx rbx, al
+    mov rsp, [task_rsp + rbx * 8]
+    mov rax, [task_kstack_top + rbx * 8]
+    mov [TSS_ADDR + 4], rax
+    jmp task_resume_common
+
+.none_alive:
+    mov byte [multitasking_active], 0
+    mov rsp, [kernel_saved_rsp]
+    sti
+    ret
+
+; spawn_and_wait: cria as duas tarefas de demo (task_a_entry/task_b_entry)
+; e ativa a multitarefa preemptiva. So "retorna" (de verdade, como um
+; call normal) quando as duas tiverem saido (syscall exit) -- o retorno
+; e feito de dentro do escalonador (scheduler_kill_and_switch/.none_alive),
+; que restaura o RSP salvo bem no inicio desta funcao.
+spawn_and_wait:
+    mov [kernel_saved_rsp], rsp        ; endereco de retorno de "call spawn_and_wait"
+
+    mov rdi, 0
+    mov rsi, task_a_entry
+    mov rdx, TASK_USTACK_BASE + TASK_USTACK_SIZE
+    call task_spawn
+
+    mov rdi, 1
+    mov rsi, task_b_entry
+    mov rdx, TASK_USTACK_BASE + (2 * TASK_USTACK_SIZE)
+    call task_spawn
+
+    mov byte [current_task], 0
+    mov byte [multitasking_active], 1
+
+    mov rax, [task_kstack_top + 0 * 8]
+    mov [TSS_ADDR + 4], rax
+
+    mov rsp, [task_rsp + 0 * 8]
+    jmp task_resume_common
+    ; nunca cai aqui por fluxo normal -- so retorna via o "ret manual" do
+    ; escalonador, descrito acima, quando as duas tarefas morrerem.
+
+; task_a_entry / task_b_entry: tarefas de demonstracao. Cada uma escreve
+; seu proprio caractere (syscall 3, direto, sem tocar VGA/serial na mao --
+; instrucoes de I/O sao privilegiadas, ring3 nao pode) repetidas vezes,
+; com uma espera ocupada bem mais longa que um tick de timer entre uma
+; escrita e outra. A prova de que o escalonador esta REALMENTE trocando
+; de tarefa (nao so rodando uma inteira, depois a outra) e ver A e B
+; INTERCALADOS no log serial durante essa espera -- nao em dois blocos
+; separados.
+TASK_DEMO_ITERATIONS equ 20
+TASK_DEMO_DELAY       equ 200000
+
+task_a_entry:
+    xor r12, r12
+.loop:
+    mov dil, 'A'
+    mov rax, 3
+    int 0x80
+
+    mov rbx, TASK_DEMO_DELAY
+.delay:
+    dec rbx
+    jnz .delay
+
+    inc r12
+    cmp r12, TASK_DEMO_ITERATIONS
+    jl .loop
+
+    mov rax, 0
+    int 0x80
+
+task_b_entry:
+    xor r12, r12
+.loop:
+    mov dil, 'B'
+    mov rax, 3
+    int 0x80
+
+    mov rbx, TASK_DEMO_DELAY
+.delay:
+    dec rbx
+    jnz .delay
+
+    inc r12
+    cmp r12, TASK_DEMO_ITERATIONS
+    jl .loop
+
+    mov rax, 0
+    int 0x80
 
 isr_addr_table:
     dq isr0, isr1, isr2, isr3, isr4, isr5, isr6, isr7
@@ -2392,6 +2673,21 @@ app_input_ready    db 0
 command_pending     db 0
 timer_ticks dq 0
 
+; multitarefa (V1): estado das TASK_COUNT (=2) tarefas fixas. Pilha de
+; kernel dedicada por tarefa (nao pode compartilhar a syscall_stack --
+; ver comentario do modulo, la em cima). Se TASK_COUNT mudar, os arrays
+; abaixo (e a lista de dq em task_kstack_top) precisam mudar junto -- nao
+; ha loop de inicializacao, e tudo fixo de proposito (escopo minimo).
+align 16
+task0_kstack: times TASK_KSTACK_SIZE db 0
+task1_kstack: times TASK_KSTACK_SIZE db 0
+align 8
+task_kstack_top:     dq (task0_kstack + TASK_KSTACK_SIZE), (task1_kstack + TASK_KSTACK_SIZE)
+task_rsp:             times TASK_COUNT dq 0
+task_state:           times TASK_COUNT db 0   ; 0 = morta/livre, 1 = viva
+current_task:         db 0
+multitasking_active:  db 0
+
 ; EVAFS: estado em memoria (ver comentario do modulo mais acima)
 fs_ready         db 0
 fs_next_free_lba dd 0
@@ -2426,7 +2722,7 @@ shell_len db 0
 
 msg_prompt      db "EVA> ", 0
 msg_unknown_cmd db "comando desconhecido: ", 0
-msg_help_text   db "comandos: help mem clear about disk run run <nome> install", 10, "          user priv echo format ls cat <nome> write <nome> <texto>", 10, 0
+msg_help_text   db "comandos: help mem clear about disk run run <nome> install", 10, "          user priv echo spawn format ls cat <nome> write <nome> <texto>", 10, 0
 msg_about       db "EVA OS - kernel experimental em Assembly (modo longo 64-bit)", 10, 0
 msg_disk_ok     db "disk: leu o setor de boot (LBA 0) via ATA PIO -- assinatura 55 AA OK", 10, 0
 msg_disk_fail   db "disk: leu o setor, mas a assinatura de boot nao bateu", 10, 0
@@ -2436,6 +2732,8 @@ msg_app_returned db "run: app retornou pro shell.", 10, 0
 msg_ring3_returned db "user: syscall exit recebida, de volta ao shell (ring0).", 10, 0
 msg_priv_survived  db "priv: o kernel sobreviveu ao crash do programa ring3.", 10, 0
 msg_echo_returned  db "echo: syscall exit recebida, de volta ao shell.", 10, 0
+msg_spawn_start db "spawn: duas tarefas (A e B) rodando via round-robin preemptivo...", 10, 0
+msg_spawn_done  db 10, "spawn: as duas tarefas terminaram (syscall exit), de volta ao shell.", 10, 0
 
 msg_fs_write_ok   db "write: arquivo salvo.", 10, 0
 msg_fs_not_ready  db "EVAFS nao formatado. Rode: format", 10, 0
@@ -2466,6 +2764,7 @@ fs_hello_name  db "hello", 0
 cmd_user  db "user", 0
 cmd_priv  db "priv", 0
 cmd_echo  db "echo", 0
+cmd_spawn db "spawn", 0
 cmd_format db "format", 0
 cmd_ls     db "ls", 0
 cmd_write_prefix db "write ", 0

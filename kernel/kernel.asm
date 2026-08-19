@@ -44,15 +44,19 @@ SYSCALL_STACK_SIZE equ 8192   ; pilha DEDICADA pra TSS.RSP0 (nao pode ser a
 ; criacao dinamica. Cada tarefa precisa de PILHA DE KERNEL propria (nao pode
 ; compartilhar a syscall_stack -- se a tarefa A for trocada no meio de uma
 ; syscall, a tarefa B nao pode pisar nos frames dela) e de PILHA DE USUARIO
-; propria (nao pode compartilhar USER_STACK_TOP). O CODIGO das tarefas de
-; demo fica embutido no kernel (todo endereco identity-mapped ja e
-; acessivel de ring3), so a pilha precisa de um endereco exclusivo por
-; tarefa.
+; propria (nao pode compartilhar USER_STACK_TOP). "spawn" sem argumento roda
+; duas tarefas de demo embutidas no kernel (task_a_entry/task_b_entry);
+; "spawn <app1> <app2>" carrega dois programas de verdade do EVAFS, cada um
+; num endereco de CODIGO exclusivo (TASK_CODE_BASE) -- apps de verdade, ao
+; contrario da demo, tem dados proprios, entao nao podem compartilhar
+; endereco entre tarefas (nem entre duas instancias do mesmo app).
 TASK_COUNT       equ 2
 TASK_KSTACK_SIZE equ 4096
 TASK_USTACK_BASE equ 0x400000  ; 4 MiB -- livre (nao colide com kernel,
                                  ; area do app loader nem USER_STACK_TOP)
 TASK_USTACK_SIZE equ 0x10000   ; 64 KiB de pilha de usuario por tarefa
+TASK_CODE_BASE   equ 0x500000  ; 5 MiB -- depois da area das pilhas acima
+TASK_CODE_SIZE   equ 0x100000  ; 1 MiB de codigo/dados por tarefa
 
 ; EVAFS: sistema de arquivos proprio, bem simples de proposito -- sem
 ; subdiretorios, sem fragmentacao (alocacao contigua via ponteiro que so
@@ -184,6 +188,12 @@ pmm_init:
     ; diante, TASK_COUNT * TASK_USTACK_SIZE bytes)
     mov rax, TASK_USTACK_BASE
     mov rdx, TASK_USTACK_BASE + (TASK_COUNT * TASK_USTACK_SIZE)
+    call mark_range_used
+
+    ; codigo/dados dos apps de verdade carregados via "spawn <a> <b>"
+    ; (TASK_CODE_BASE em diante, TASK_COUNT * TASK_CODE_SIZE bytes)
+    mov rax, TASK_CODE_BASE
+    mov rdx, TASK_CODE_BASE + (TASK_COUNT * TASK_CODE_SIZE)
     call mark_range_used
     ret
 
@@ -1400,6 +1410,11 @@ shell_execute:
     test al, al
     jnz .do_spawn
 
+    mov rdi, cmd_spawn_prefix
+    call str_prefix
+    test al, al
+    jnz .do_spawn_named
+
     mov rdi, cmd_format
     call str_equal
     test al, al
@@ -1533,10 +1548,90 @@ shell_execute:
     jmp .done
 
 .do_spawn:
+    ; sem argumentos: roda as duas tarefas de demo embutidas no kernel.
     mov rsi, msg_spawn_start
     call print_string
+    mov rdi, task_a_entry
+    mov rsi, task_b_entry
     call spawn_and_wait
     mov rsi, msg_spawn_done
+    call print_string
+    jmp .done
+
+.do_spawn_named:
+    ; RSI -> "<app1> <app2>" (ja avancado pelo str_prefix "spawn "). Cada
+    ; nome vai pro proprio buffer (nao pode reusar fs_name_buf pros dois
+    ; -- precisa dos dois nomes vivos ao mesmo tempo pras duas chamadas
+    ; de fs_load_binary).
+    mov rdi, spawn_name1_buf
+    xor rcx, rcx
+.spawn_name1_loop:
+    mov al, [rsi]
+    test al, al
+    jz .spawn_usage              ; acabou a linha sem achar o 2o nome
+    cmp al, ' '
+    je .spawn_name1_done
+    cmp rcx, FS_NAME_MAX - 1
+    jae .spawn_name1_done
+    mov [rdi + rcx], al
+    inc rcx
+    inc rsi
+    jmp .spawn_name1_loop
+.spawn_name1_done:
+    mov byte [rdi + rcx], 0
+    cmp rcx, 0
+    je .spawn_usage
+    cmp byte [rsi], ' '
+    jne .spawn_usage
+    inc rsi
+
+    mov rdi, spawn_name2_buf
+    xor rcx, rcx
+.spawn_name2_loop:
+    mov al, [rsi]
+    test al, al
+    jz .spawn_name2_done
+    cmp al, ' '
+    je .spawn_name2_done
+    cmp rcx, FS_NAME_MAX - 1
+    jae .spawn_name2_done
+    mov [rdi + rcx], al
+    inc rcx
+    inc rsi
+    jmp .spawn_name2_loop
+.spawn_name2_done:
+    mov byte [rdi + rcx], 0
+    cmp rcx, 0
+    je .spawn_usage
+
+    mov rdi, spawn_name1_buf
+    mov rsi, TASK_CODE_BASE + (0 * TASK_CODE_SIZE)
+    call fs_load_binary
+    test al, al
+    jz .spawn_not_found
+
+    mov rdi, spawn_name2_buf
+    mov rsi, TASK_CODE_BASE + (1 * TASK_CODE_SIZE)
+    call fs_load_binary
+    test al, al
+    jz .spawn_not_found
+
+    mov rsi, msg_spawn_start
+    call print_string
+    mov rdi, TASK_CODE_BASE + (0 * TASK_CODE_SIZE)
+    mov rsi, TASK_CODE_BASE + (1 * TASK_CODE_SIZE)
+    call spawn_and_wait
+    mov rsi, msg_spawn_done
+    call print_string
+    jmp .done
+
+.spawn_usage:
+    mov rsi, msg_spawn_usage
+    call print_string
+    jmp .done
+
+.spawn_not_found:
+    mov rsi, msg_fs_not_found
     call print_string
     jmp .done
 
@@ -1922,15 +2017,27 @@ isr_common_stub:
     jmp .halt
 
 .ring3_fault:
-    ; excecao dentro de um programa ring3: mata SO ele (troca de pilha +
-    ; "ret", igual a syscall exit) e devolve o controle pro shell -- o
-    ; kernel continua rodando normalmente.
+    ; excecao dentro de um programa ring3: mata SO ele -- o kernel (e,
+    ; durante multitarefa, as OUTRAS tarefas) continuam rodando normalmente.
     mov rsi, msg_killed
     call print_string
+
+    ; fora da multitarefa: mesmo truque de sempre (troca de pilha + RET
+    ; manual, "retorna" de enter_usermode pro chamador). Dentro dela: nao
+    ; ha stack de GP regs pra restaurar aqui (isr_common_stub, ao contrario
+    ; de isr_irq_common_stub/isr_syscall_stub, nunca empilhou os 15 -- mas
+    ; nao importa, a tarefa que crashou esta sendo descartada mesmo, so a
+    ; PROXIMA tarefa escolhida precisa da pilha dela intacta, e essa nunca
+    ; foi tocada aqui).
+    cmp byte [multitasking_active], 0
+    jne .ring3_fault_task
     mov rsp, [kernel_saved_rsp]
     sti                              ; mesmo motivo do sys_exit: RET manual nao
                                        ; restaura RFLAGS sozinho, tem que religar IF
     ret
+
+.ring3_fault_task:
+    jmp scheduler_kill_and_switch   ; NUNCA "call" -- ver nota em isr_irq_common_stub
 
 ; IRQ de hardware: precisa devolver o controle pro codigo interrompido,
 ; entao salva TODOS os registradores de proposito geral antes de despachar
@@ -2412,21 +2519,26 @@ scheduler_kill_and_switch:
     sti
     ret
 
-; spawn_and_wait: cria as duas tarefas de demo (task_a_entry/task_b_entry)
-; e ativa a multitarefa preemptiva. So "retorna" (de verdade, como um
-; call normal) quando as duas tiverem saido (syscall exit) -- o retorno
-; e feito de dentro do escalonador (scheduler_kill_and_switch/.none_alive),
-; que restaura o RSP salvo bem no inicio desta funcao.
+; spawn_and_wait: RDI=ponto de entrada da tarefa 0, RSI=ponto de entrada
+; da tarefa 1 (ring3 -- ou os labels de demo embutidos, ou um endereco em
+; TASK_CODE_BASE onde o chamador ja carregou um app de verdade via
+; fs_load_binary). Cria as duas tarefas e ativa a multitarefa preemptiva.
+; So "retorna" (de verdade, como um call normal) quando as duas tiverem
+; saido (syscall exit) -- o retorno e feito de dentro do escalonador
+; (scheduler_kill_and_switch/.none_alive), que restaura o RSP salvo bem
+; no inicio desta funcao.
 spawn_and_wait:
     mov [kernel_saved_rsp], rsp        ; endereco de retorno de "call spawn_and_wait"
+    mov r12, rdi                        ; entrada da tarefa 0 (RDI/RSI vao
+    mov r13, rsi                        ; ser sobrescritos por task_spawn)
 
     mov rdi, 0
-    mov rsi, task_a_entry
+    mov rsi, r12
     mov rdx, TASK_USTACK_BASE + TASK_USTACK_SIZE
     call task_spawn
 
     mov rdi, 1
-    mov rsi, task_b_entry
+    mov rsi, r13
     mov rdx, TASK_USTACK_BASE + (2 * TASK_USTACK_SIZE)
     call task_spawn
 
@@ -2693,6 +2805,8 @@ fs_ready         db 0
 fs_next_free_lba dd 0
 fs_file_count    dd 0
 fs_name_buf: times (FS_NAME_MAX + 1) db 0   ; buffer temporario pro "write <nome> ..."
+spawn_name1_buf: times (FS_NAME_MAX + 1) db 0   ; buffers pro "spawn <app1> <app2>"
+spawn_name2_buf: times (FS_NAME_MAX + 1) db 0
 
 align 16
 fs_io_buf: times 512 db 0
@@ -2722,7 +2836,7 @@ shell_len db 0
 
 msg_prompt      db "EVA> ", 0
 msg_unknown_cmd db "comando desconhecido: ", 0
-msg_help_text   db "comandos: help mem clear about disk run run <nome> install", 10, "          user priv echo spawn format ls cat <nome> write <nome> <texto>", 10, 0
+msg_help_text   db "comandos: help mem clear about disk run run <nome> install", 10, "          user priv echo spawn spawn <a> <b> format ls cat <nome> write <nome> <texto>", 10, 0
 msg_about       db "EVA OS - kernel experimental em Assembly (modo longo 64-bit)", 10, 0
 msg_disk_ok     db "disk: leu o setor de boot (LBA 0) via ATA PIO -- assinatura 55 AA OK", 10, 0
 msg_disk_fail   db "disk: leu o setor, mas a assinatura de boot nao bateu", 10, 0
@@ -2732,8 +2846,9 @@ msg_app_returned db "run: app retornou pro shell.", 10, 0
 msg_ring3_returned db "user: syscall exit recebida, de volta ao shell (ring0).", 10, 0
 msg_priv_survived  db "priv: o kernel sobreviveu ao crash do programa ring3.", 10, 0
 msg_echo_returned  db "echo: syscall exit recebida, de volta ao shell.", 10, 0
-msg_spawn_start db "spawn: duas tarefas (A e B) rodando via round-robin preemptivo...", 10, 0
+msg_spawn_start db "spawn: duas tarefas rodando via round-robin preemptivo...", 10, 0
 msg_spawn_done  db 10, "spawn: as duas tarefas terminaram (syscall exit), de volta ao shell.", 10, 0
+msg_spawn_usage db "uso: spawn (demo A/B) ou spawn <app1> <app2> (dois programas do EVAFS)", 10, 0
 
 msg_fs_write_ok   db "write: arquivo salvo.", 10, 0
 msg_fs_not_ready  db "EVAFS nao formatado. Rode: format", 10, 0
@@ -2765,6 +2880,7 @@ cmd_user  db "user", 0
 cmd_priv  db "priv", 0
 cmd_echo  db "echo", 0
 cmd_spawn db "spawn", 0
+cmd_spawn_prefix db "spawn ", 0
 cmd_format db "format", 0
 cmd_ls     db "ls", 0
 cmd_write_prefix db "write ", 0

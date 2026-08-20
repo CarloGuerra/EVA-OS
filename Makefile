@@ -29,7 +29,7 @@ $(DISK_IMG): $(BOOT_BIN) $(STAGE2_BIN) $(KERNEL_BIN) $(HELLO_BIN)
 	dd if=$(BOOT_BIN) of=$(DISK_IMG) conv=notrunc
 	dd if=$(STAGE2_BIN) of=$(DISK_IMG) bs=512 seek=1 conv=notrunc
 	dd if=$(KERNEL_BIN) of=$(DISK_IMG) bs=512 seek=17 conv=notrunc
-	dd if=$(HELLO_BIN) of=$(DISK_IMG) bs=512 seek=145 conv=notrunc
+	dd if=$(HELLO_BIN) of=$(DISK_IMG) bs=512 seek=280 conv=notrunc
 
 run: $(DISK_IMG)
 	qemu-system-x86_64 -drive format=raw,file=$(DISK_IMG)

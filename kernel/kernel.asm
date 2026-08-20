@@ -13,7 +13,7 @@ CODE64_SEG equ 0x08   ; selector do segmento de codigo na GDT64 do stage2
 ISR_COUNT  equ 34     ; vetores 0-31 (excecoes da CPU) + 32,33 (IRQ0, IRQ1)
 
 KERNEL_LOAD_ADDR  equ 0x100000
-KERNEL_IMAGE_SIZE equ 128 * 512   ; precisa bater com KERNEL_SECTORS do stage2.asm
+KERNEL_IMAGE_SIZE equ 256 * 512   ; precisa bater com KERNEL_SECTORS do stage2.asm
 
 ; onde o stage2 guardou o mapa de memoria da BIOS (E820) -- precisa bater
 ; com os mesmos valores em boot/stage2.asm.
@@ -34,6 +34,13 @@ USER_CODE_SEL equ 32
 USER_DATA_SEL equ 24
 TSS_SEL       equ 40
 TSS_ADDR      equ 0x5000
+
+; resultado da deteccao VBE feita pelo stage2 (modo real, INT 10h -- o
+; kernel nao pode chamar a BIOS, entao so LE o que foi preenchido antes de
+; entrar em modo longo). Precisa bater com boot/stage2.asm. Layout: ver
+; comentario la; em resumo, dword disponivel(0/1) + PhysBasePtr + largura
+; + altura + pitch + bpp, 24 bytes no total.
+FB_INFO_ADDR equ 0x5100
 
 USER_STACK_TOP equ 0x300000   ; 3 MiB -- dentro do 1 GiB identity-mapped
 SYSCALL_STACK_SIZE equ 8192   ; pilha DEDICADA pra TSS.RSP0 (nao pode ser a
@@ -61,14 +68,17 @@ TASK_CODE_SIZE   equ 0x100000  ; 1 MiB de codigo/dados por tarefa
 ; EVAFS: sistema de arquivos proprio, bem simples de proposito -- sem
 ; subdiretorios, sem fragmentacao (alocacao contigua via ponteiro que so
 ; cresce, nunca reaproveita espaco de arquivo apagado/sobrescrito).
-;   LBA 200      : superbloco (1 setor)
-;   LBA 201-202  : diretorio (2 setores = 32 entradas de 32 bytes)
-;   LBA 210+     : dados dos arquivos
+; LBAs empurrados pra frente (200->300 etc.) quando o kernel cresceu pra
+; 256 setores (era 128) -- precisa ficar fora da faixa que o kernel ocupa
+; no disco (KERNEL_LBA..KERNEL_LBA+KERNEL_SECTORS-1, boot/stage2.asm).
+;   LBA 300      : superbloco (1 setor)
+;   LBA 301-302  : diretorio (2 setores = 32 entradas de 32 bytes)
+;   LBA 310+     : dados dos arquivos
 FS_MAGIC          equ 0x53464145   ; "EAFS" lido como dword little-endian
-FS_SUPERBLOCK_LBA equ 200
-FS_DIR_LBA        equ 201
+FS_SUPERBLOCK_LBA equ 300
+FS_DIR_LBA        equ 301
 FS_DIR_SECTORS    equ 2
-FS_DATA_START_LBA equ 210
+FS_DATA_START_LBA equ 310
 FS_MAX_FILES      equ 32
 FS_ENTRY_SIZE     equ 32           ; name[24] + start_lba(4) + size_bytes(4)
 FS_NAME_MAX       equ 23           ; 23 chars + terminador dentro dos 24
@@ -195,6 +205,37 @@ pmm_init:
     mov rax, TASK_CODE_BASE
     mov rdx, TASK_CODE_BASE + (TASK_COUNT * TASK_CODE_SIZE)
     call mark_range_used
+
+    ; framebuffer VBE detectado pelo stage2 (se houver): normalmente cai
+    ; bem acima do 1 GiB que ESTE bitmap rastreia (BAR de PCI, longe de
+    ; qualquer faixa que o E820 chame de RAM usavel) -- nesse caso
+    ; alloc_frame (que so varre ate BITMAP_FRAMES) NUNCA devolveria esses
+    ; enderecos mesmo sem reserva nenhuma, entao pular e seguro, nao um
+    ; buraco. SO reserva de verdade quando a faixa cai dentro do 1 GiB
+    ; rastreado -- chamar mark_range_used fora disso escreveria fora dos
+    ; limites do frame_bitmap (nem mark_range_used nem set_bit tem
+    ; checagem propria de limite).
+    cmp dword [FB_INFO_ADDR], 0
+    je .no_fb_reserve
+
+    mov eax, [FB_INFO_ADDR + 16]        ; pitch (bytes por linha)
+    mov ecx, [FB_INFO_ADDR + 12]         ; altura (pixels)
+    mul ecx                                ; edx:eax = pitch * altura (tamanho
+                                             ; do LFB em bytes; framebuffers
+                                             ; reais nunca chegam perto de
+                                             ; 4 GiB, edx fica 0)
+    mov r8d, eax
+
+    mov eax, [FB_INFO_ADDR + 4]             ; PhysBasePtr
+    mov rdx, rax
+    add rdx, r8                              ; rdx = fim (exclusivo)
+
+    cmp rdx, (BITMAP_FRAMES * FRAME_SIZE)
+    ja .no_fb_reserve
+
+    call mark_range_used                       ; rax ja e o inicio (PhysBasePtr)
+
+.no_fb_reserve:
     ret
 
 ; free_range: RAX=inicio (bytes), RDX=fim (bytes, exclusivo) -> zera os bits
@@ -1232,7 +1273,9 @@ fs_write_raw:
 ; (int 0x80), terminando com a syscall exit (RAX=0).
 ; =======================================================================
 
-APP_LBA        equ 145        ; logo depois da area reservada pro kernel
+APP_LBA        equ 280        ; logo depois da area reservada pro kernel (256
+                                ; setores a partir do LBA 17); precisa bater
+                                ; com o "seek=" do hello.bin no Makefile
 APP_SECTORS    equ 8
 APP_LOAD_ADDR  equ 0x200000   ; 2 MiB -- dentro do 1 GiB identity-mapped
 
@@ -1414,6 +1457,11 @@ shell_execute:
     call str_prefix
     test al, al
     jnz .do_spawn_named
+
+    mov rdi, cmd_vbe
+    call str_equal
+    test al, al
+    jnz .do_vbe
 
     mov rdi, cmd_format
     call str_equal
@@ -1632,6 +1680,77 @@ shell_execute:
 
 .spawn_not_found:
     mov rsi, msg_fs_not_found
+    call print_string
+    jmp .done
+
+.do_vbe:
+    ; FB_INFO_ADDR foi preenchido pelo stage2 (modo real, INT 10h -- o
+    ; kernel nao pode chamar BIOS, so le o resultado). So reporta; ainda
+    ; nao troca de modo de video (isso e um passo separado, futuro).
+    cmp dword [FB_INFO_ADDR], 0
+    je .vbe_none
+
+    mov rsi, msg_vbe_found
+    call print_string
+
+    mov rsi, msg_vbe_res
+    call print_string
+    xor rdx, rdx
+    mov edx, [FB_INFO_ADDR + 8]      ; largura
+    call print_hex_qword
+    mov rsi, msg_vbe_x
+    call print_string
+    xor rdx, rdx
+    mov edx, [FB_INFO_ADDR + 12]      ; altura
+    call print_hex_qword
+    mov rsi, msg_vbe_bpp
+    call print_string
+    xor rdx, rdx
+    mov edx, [FB_INFO_ADDR + 20]       ; bits por pixel
+    call print_hex_qword
+
+    mov rsi, msg_vbe_base
+    call print_string
+    xor rdx, rdx
+    mov edx, [FB_INFO_ADDR + 4]         ; PhysBasePtr
+    call print_hex_qword
+
+    mov rsi, msg_vbe_pitch
+    call print_string
+    xor rdx, rdx
+    mov edx, [FB_INFO_ADDR + 16]         ; pitch
+    call print_hex_qword
+
+    mov rsi, msg_newline2
+    call print_string
+
+    ; prova de que a extensao de tabela de paginas (PD_HIGH_ADDR, montada
+    ; pelo stage2 em setup_page_tables) realmente mapeou o GiB do
+    ; framebuffer: escreve um valor de teste no endereco fisico dele e le
+    ; de volta. Se o identity map estivesse errado/faltando, isso daria
+    ; #GP/#PF (o kernel morreria de verdade -- CPL0, sem recuperacao) em
+    ; vez de so imprimir "falhou".
+    mov eax, [FB_INFO_ADDR + 4]        ; PhysBasePtr
+    mov rdi, rax
+    mov rbx, [rdi]                       ; guarda o valor original
+    mov qword [rdi], 0x1122334455667788
+    mov rax, [rdi]
+    mov [rdi], rbx                        ; restaura antes de comparar (nao
+                                            ; deixa lixo no framebuffer)
+    cmp rax, 0x1122334455667788
+    jne .vbe_fb_fail
+
+    mov rsi, msg_vbe_fb_ok
+    call print_string
+    jmp .done
+
+.vbe_fb_fail:
+    mov rsi, msg_vbe_fb_fail
+    call print_string
+    jmp .done
+
+.vbe_none:
+    mov rsi, msg_vbe_none
     call print_string
     jmp .done
 
@@ -2836,7 +2955,7 @@ shell_len db 0
 
 msg_prompt      db "EVA> ", 0
 msg_unknown_cmd db "comando desconhecido: ", 0
-msg_help_text   db "comandos: help mem clear about disk run run <nome> install", 10, "          user priv echo spawn spawn <a> <b> format ls cat <nome> write <nome> <texto>", 10, 0
+msg_help_text   db "comandos: help mem clear about disk run run <nome> install", 10, "          user priv echo spawn spawn <a> <b> vbe format ls cat <nome> write <nome> <texto>", 10, 0
 msg_about       db "EVA OS - kernel experimental em Assembly (modo longo 64-bit)", 10, 0
 msg_disk_ok     db "disk: leu o setor de boot (LBA 0) via ATA PIO -- assinatura 55 AA OK", 10, 0
 msg_disk_fail   db "disk: leu o setor, mas a assinatura de boot nao bateu", 10, 0
@@ -2849,6 +2968,16 @@ msg_echo_returned  db "echo: syscall exit recebida, de volta ao shell.", 10, 0
 msg_spawn_start db "spawn: duas tarefas rodando via round-robin preemptivo...", 10, 0
 msg_spawn_done  db 10, "spawn: as duas tarefas terminaram (syscall exit), de volta ao shell.", 10, 0
 msg_spawn_usage db "uso: spawn (demo A/B) ou spawn <app1> <app2> (dois programas do EVAFS)", 10, 0
+
+msg_vbe_found db "vbe: framebuffer linear disponivel (detectado pelo stage2, ainda nao ativado)", 10, 0
+msg_vbe_res   db "  resolucao: 0x", 0
+msg_vbe_x     db " x 0x", 0
+msg_vbe_bpp   db " bpp=0x", 0
+msg_vbe_base  db 10, "  endereco fisico do framebuffer: 0x", 0
+msg_vbe_pitch db "  pitch (bytes por linha): 0x", 0
+msg_vbe_none  db "vbe: nenhum modo grafico com framebuffer linear encontrado -- seguindo em modo texto", 10, 0
+msg_vbe_fb_ok   db "vbe: teste de escrita/leitura no framebuffer OK -- identity map confere.", 10, 0
+msg_vbe_fb_fail db "vbe: teste de escrita/leitura no framebuffer FALHOU -- endereco nao mapeado direito.", 10, 0
 
 msg_fs_write_ok   db "write: arquivo salvo.", 10, 0
 msg_fs_not_ready  db "EVAFS nao formatado. Rode: format", 10, 0
@@ -2881,6 +3010,7 @@ cmd_priv  db "priv", 0
 cmd_echo  db "echo", 0
 cmd_spawn db "spawn", 0
 cmd_spawn_prefix db "spawn ", 0
+cmd_vbe db "vbe", 0
 cmd_format db "format", 0
 cmd_ls     db "ls", 0
 cmd_write_prefix db "write ", 0

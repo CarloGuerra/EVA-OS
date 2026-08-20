@@ -35,7 +35,7 @@ E820_MAP_ADDR   equ 0x4008       ; array de entradas, 24 bytes cada
 TSS_ADDR equ 0x5000
 
 ; resultado da deteccao VBE (modo grafico linear), pro kernel ler depois.
-; Precisa bater com o mesmo valor em kernel/kernel.asm. Layout (24 bytes,
+; Precisa bater com o mesmo valor em kernel/kernel.asm. Layout (36 bytes,
 ; todos os campos dword mesmo os que caberiam num byte/word, por
 ; simplicidade -- ver vbe_detect_and_report):
 ;   +0  disponivel (0 = nenhum modo com framebuffer linear encontrado,
@@ -45,6 +45,12 @@ TSS_ADDR equ 0x5000
 ;   +12 altura (pixels)
 ;   +16 pitch (bytes por linha, pode ser > largura*bpp/8 por alinhamento)
 ;   +20 bits por pixel
+;   +24 posicao (em bits) do campo vermelho dentro de cada pixel
+;   +28 posicao do campo verde
+;   +32 posicao do campo azul
+; (posicoes de R/G/B: nao dava pra supor 0x00RRGGBB fixo -- layouts de
+; 32bpp variam por hardware; o kernel usa isso pra empacotar cor certo
+; em QUALQUER maquina que siga VBE 2.0, nao so no que o QEMU relata.)
 FB_INFO_ADDR equ 0x5100
 VBE_INFO_BLOCK_ADDR equ 0x5200    ; buffer temporario (512 bytes), so usado
                                     ; durante a deteccao, no boot
@@ -53,6 +59,14 @@ VBE_MODE_INFO_ADDR  equ 0x5400    ; idem (256 bytes)
 ; PD extra pra identity-mapear o GiB onde o framebuffer VBE cair, se nao
 ; for o GiB 0 (ja coberto pela PD principal) -- ver setup_page_tables.
 PD_HIGH_ADDR equ 0x7000
+
+; 0 desliga a troca de verdade de modo de video (INT 10h/4F02h), deixando
+; so a deteccao (FB_INFO_ADDR preenchido, mas a placa continua em modo
+; texto) -- rede de seguranca barata: se o renderizador via framebuffer
+; do kernel tiver algum bug, basta mudar isso pra 0 e recompilar pra
+; voltar ao caminho conhecido-bom (VGA texto 80x25), sem reverter mais
+; nada.
+VBE_MODESET_ENABLED equ 1
 
 ORG 0x8000
 
@@ -83,11 +97,11 @@ stage2_start:
 
     call detect_memory     ; ainda em modo real -- so a BIOS sabe o mapa de RAM
     call vbe_detect_and_report  ; idem -- VBE (INT 10h) so existe em modo real.
-                                  ; So DETECTA e preenche FB_INFO_ADDR; NAO troca
-                                  ; de modo de video (isso e definitivo -- uma vez
-                                  ; em modo longo nao da mais pra chamar a BIOS --
-                                  ; entao a troca de verdade fica pra depois, como
-                                  ; passo separado e explicito).
+                                  ; Detecta, preenche FB_INFO_ADDR e (se
+                                  ; VBE_MODESET_ENABLED) troca de verdade pro
+                                  ; modo grafico encontrado -- definitivo, uma
+                                  ; vez em modo longo nao da mais pra chamar a
+                                  ; BIOS de novo.
 
     ; habilita A20 (metodo rapido via porta 0x92)
     in al, 0x92
@@ -233,7 +247,30 @@ vbe_detect_and_report:
     mov [FB_INFO_ADDR + 16], eax
     movzx eax, byte [VBE_MODE_INFO_ADDR + 25]        ; BitsPerPixel
     mov [FB_INFO_ADDR + 20], eax
+    movzx eax, byte [VBE_MODE_INFO_ADDR + 32]         ; posicao do campo vermelho
+    mov [FB_INFO_ADDR + 24], eax
+    movzx eax, byte [VBE_MODE_INFO_ADDR + 34]          ; posicao do campo verde
+    mov [FB_INFO_ADDR + 28], eax
+    movzx eax, byte [VBE_MODE_INFO_ADDR + 36]           ; posicao do campo azul
+    mov [FB_INFO_ADDR + 32], eax
     mov dword [FB_INFO_ADDR], 1
+
+%if VBE_MODESET_ENABLED
+    ; troca de verdade pro modo escolhido (bit14 = usar framebuffer
+    ; linear). Isso e DEFINITIVO -- 0xB8000 (texto VGA) para de ser
+    ; exibido a partir daqui; o kernel decide sozinho (via FB_INFO_ADDR)
+    ; que a saida de texto agora e via framebuffer (ver kernel.asm,
+    ; fb_init/putchar).
+    mov bx, [vbe_found_mode]
+    or bx, 0x4000
+    mov ax, 0x4F02
+    int 0x10
+    cmp ax, 0x004F
+    je .modeset_ok
+    mov dword [FB_INFO_ADDR], 0   ; troca falhou -- desiste, segue em modo
+                                    ; texto (a placa nao mudou de modo)
+.modeset_ok:
+%endif
     ret
 
 .unsupported:

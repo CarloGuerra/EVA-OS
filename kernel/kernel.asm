@@ -37,9 +37,10 @@ TSS_ADDR      equ 0x5000
 
 ; resultado da deteccao VBE feita pelo stage2 (modo real, INT 10h -- o
 ; kernel nao pode chamar a BIOS, entao so LE o que foi preenchido antes de
-; entrar em modo longo). Precisa bater com boot/stage2.asm. Layout: ver
+; entrar em modo longo, e so troca de modo de video se VBE_MODESET_ENABLED
+; estiver ligado la). Precisa bater com boot/stage2.asm. Layout: ver
 ; comentario la; em resumo, dword disponivel(0/1) + PhysBasePtr + largura
-; + altura + pitch + bpp, 24 bytes no total.
+; + altura + pitch + bpp + posicao dos campos R/G/B, 36 bytes no total.
 FB_INFO_ADDR equ 0x5100
 
 USER_STACK_TOP equ 0x300000   ; 3 MiB -- dentro do 1 GiB identity-mapped
@@ -85,6 +86,10 @@ FS_NAME_MAX       equ 23           ; 23 chars + terminador dentro dos 24
 
 kernel_entry:
     mov rsp, 0x90000
+
+    call fb_init         ; TEM que rodar antes do primeiro print_string --
+                           ; putchar decide VGA texto vs framebuffer com
+                           ; base no que fb_init preenche
 
     mov rsi, msg_boot
     call print_string
@@ -1685,8 +1690,9 @@ shell_execute:
 
 .do_vbe:
     ; FB_INFO_ADDR foi preenchido pelo stage2 (modo real, INT 10h -- o
-    ; kernel nao pode chamar BIOS, so le o resultado). So reporta; ainda
-    ; nao troca de modo de video (isso e um passo separado, futuro).
+    ; kernel nao pode chamar BIOS, so le o resultado). Se "disponivel", a
+    ; troca de modo ja aconteceu de verdade la (VBE_MODESET_ENABLED em
+    ; boot/stage2.asm) -- este comando so reporta o que foi detectado.
     cmp dword [FB_INFO_ADDR], 0
     je .vbe_none
 
@@ -1733,11 +1739,15 @@ shell_execute:
     mov eax, [FB_INFO_ADDR + 4]        ; PhysBasePtr
     mov rdi, rax
     mov rbx, [rdi]                       ; guarda o valor original
-    mov qword [rdi], 0x1122334455667788
+    mov r9, 0x1122334455667788          ; MOV/CMP pra memoria nao aceitam
+                                          ; imediato de 64 bits de verdade
+                                          ; (so 32 com extensao de sinal) --
+                                          ; carrega num registrador primeiro
+    mov [rdi], r9
     mov rax, [rdi]
     mov [rdi], rbx                        ; restaura antes de comparar (nao
                                             ; deixa lixo no framebuffer)
-    cmp rax, 0x1122334455667788
+    cmp rax, r9
     jne .vbe_fb_fail
 
     mov rsi, msg_vbe_fb_ok
@@ -1910,19 +1920,40 @@ print_bytes:
 ; clear_screen: apaga o buffer de video inteiro e reseta o cursor pra (0,0)
 clear_screen:
     push rax
+    push rbx
     push rcx
     push rdi
+
+    cmp byte [fb_text_mode], 0
+    jne .fb_clear
 
     mov rdi, 0xB8000
     mov rax, 0x0F200F200F200F20
     mov rcx, (80 * 25 * 2) / 8
     rep stosq
+    jmp .reset_cursor
 
+.fb_clear:
+    mov rdi, [fb_base]
+    mov rax, [fb_pitch]
+    mov rbx, [fb_height]
+    mul rbx                     ; rax = pitch * altura (bytes totais do framebuffer)
+    mov rcx, rax
+    shr rcx, 2                    ; /4 -- rep stosd escreve dwords (1 pixel cada)
+
+    call fb_pack_bg                ; eax = cor de fundo empacotada (por
+                                     ; ultimo, de proposito -- so precisa
+                                     ; sobreviver ate o rep stosd logo abaixo;
+                                     ; preserva rdi/rcx sozinha)
+    rep stosd
+
+.reset_cursor:
     mov qword [cursor_row], 0
     mov qword [cursor_col], 0
 
     pop rdi
     pop rcx
+    pop rbx
     pop rax
     ret
 
@@ -2738,8 +2769,195 @@ idt_descriptor:
     dq idt_table
 
 ; =======================================================================
-; saida de texto (VGA modo texto 80x25 + espelho na serial COM1)
+; saida de texto: framebuffer VBE (fonte bitmap 8x8) quando disponivel,
+; senao VGA modo texto 80x25 -- SEMPRE com espelho na serial COM1 (o que
+; mantem todo o historico de testes automatizados por log serial valido
+; mesmo depois de trocar de modo de video).
 ; =======================================================================
+
+FB_FG_COLOR equ 0x00E0E0E0   ; branco acinzentado, 0x00RRGGBB "puro" --
+                               ; empacotado pra posicao real de bits do
+                               ; hardware dentro de fb_pack_color
+FB_BG_COLOR equ 0x00000000   ; preto
+
+; fb_init: le FB_INFO_ADDR (preenchido pelo stage2) e prepara os globais
+; fb_* usados pelo resto da saida de texto. TEM que rodar antes do
+; primeiro putchar -- ver a chamada logo no topo de kernel_entry.
+fb_init:
+    push rax
+
+    cmp dword [FB_INFO_ADDR], 0
+    je .no_fb
+
+    mov eax, [FB_INFO_ADDR + 4]
+    mov [fb_base], rax
+    mov eax, [FB_INFO_ADDR + 8]
+    mov [fb_width], rax
+    mov eax, [FB_INFO_ADDR + 12]
+    mov [fb_height], rax
+    mov eax, [FB_INFO_ADDR + 16]
+    mov [fb_pitch], rax
+    mov eax, [FB_INFO_ADDR + 24]
+    mov [fb_red_pos], al
+    mov eax, [FB_INFO_ADDR + 28]
+    mov [fb_green_pos], al
+    mov eax, [FB_INFO_ADDR + 32]
+    mov [fb_blue_pos], al
+
+    mov rax, [fb_width]
+    shr rax, 3                  ; fonte de 8x8 -- colunas de caractere = largura/8
+    mov [fb_cols], rax
+    mov rax, [fb_height]
+    shr rax, 3
+    mov [fb_rows], rax
+
+    mov byte [fb_text_mode], 1
+    jmp .done
+.no_fb:
+    mov byte [fb_text_mode], 0
+.done:
+    pop rax
+    ret
+
+; fb_pack_color: EAX = cor de entrada (0x00RRGGBB) -> EAX = cor empacotada
+; pra posicao real de bits do hardware (fb_red_pos/green_pos/blue_pos --
+; nao assume 0x00RRGGBB fixo, adapta a qualquer layout de 32bpp que a
+; deteccao VBE tiver relatado).
+fb_pack_color:
+    push rbx
+    push rcx
+    push rsi
+    push rdi
+
+    mov esi, eax
+
+    mov edi, esi
+    shr edi, 16
+    and edi, 0xFF                 ; R
+    mov cl, [fb_red_pos]
+    shl edi, cl
+
+    mov ebx, esi
+    shr ebx, 8
+    and ebx, 0xFF                  ; G
+    mov cl, [fb_green_pos]
+    shl ebx, cl
+
+    mov eax, esi
+    and eax, 0xFF                   ; B
+    mov cl, [fb_blue_pos]
+    shl eax, cl
+
+    or eax, edi
+    or eax, ebx
+
+    pop rdi
+    pop rsi
+    pop rcx
+    pop rbx
+    ret
+
+fb_pack_fg:
+    mov eax, FB_FG_COLOR
+    jmp fb_pack_color
+
+fb_pack_bg:
+    mov eax, FB_BG_COLOR
+    jmp fb_pack_color
+
+; fb_draw_glyph: AL = caractere. Desenha o glifo 8x8 correspondente
+; (font8x8, indexada por char-32) na posicao de pixel atual
+; (cursor_col*8, cursor_row*8), FB_FG_COLOR sobre FB_BG_COLOR. Nao mexe
+; em cursor_row/cursor_col -- quem chama (putchar) cuida disso.
+fb_draw_glyph:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+
+    movzx rbx, al
+    cmp bl, 32
+    jb .use_space
+    cmp bl, 126
+    ja .use_space
+    sub bl, 32
+    jmp .have_index
+.use_space:
+    xor bl, bl
+.have_index:
+    movzx rbx, bl
+    shl rbx, 3                    ; indice * 8 bytes por glifo
+    lea rsi, [font8x8 + rbx]
+
+    mov rax, [cursor_col]
+    shl rax, 3
+    mov r8, rax                    ; r8 = x base (pixels), fixo pro resto da funcao
+
+    mov rax, [cursor_row]
+    shl rax, 3
+    mov r9, rax                     ; r9 = y base (pixels), fixo
+
+    call fb_pack_fg
+    mov r10d, eax
+    call fb_pack_bg
+    mov r11d, eax
+
+    xor rcx, rcx                     ; rcx = linha do glifo (0-7)
+.row_loop:
+    ; endereco do 1o pixel desta linha: fb_base + (y_base+linha)*pitch + x_base*4
+    ; (o "mul" abaixo clobra RDX -- por isso o bitmap da linha so e lido
+    ; DEPOIS, nunca antes; ja foi bug real aqui numa revisao antes de
+    ; testar)
+    mov rax, r9
+    add rax, rcx
+    mov rbx, [fb_pitch]
+    mul rbx
+    add rax, [fb_base]
+    mov rbx, r8
+    shl rbx, 2
+    add rax, rbx
+    mov rdi, rax
+
+    movzx rdx, byte [rsi + rcx]        ; bitmap da linha, agora que RDX esta livre
+
+    xor r12, r12
+.col_loop:
+    test dl, 0x80
+    jz .bg_pixel
+    mov [rdi], r10d
+    jmp .next_pixel
+.bg_pixel:
+    mov [rdi], r11d
+.next_pixel:
+    add rdi, 4
+    shl dl, 1
+    inc r12
+    cmp r12, 8
+    jl .col_loop
+
+    inc rcx
+    cmp rcx, 8
+    jl .row_loop
+
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
 
 ; putchar: AL = caractere
 putchar:
@@ -2752,6 +2970,9 @@ putchar:
     cmp r8b, 10           ; '\n' ?
     je .newline
 
+    cmp byte [fb_text_mode], 0
+    jne .fb_draw
+
     mov rax, [cursor_row]
     mov rbx, 80
     mul rbx
@@ -2761,10 +2982,21 @@ putchar:
     add rcx, rax
     mov byte [rcx], r8b
     mov byte [rcx + 1], 0x0F
+    jmp .advance_col
 
+.fb_draw:
+    mov al, r8b
+    call fb_draw_glyph
+
+.advance_col:
     inc qword [cursor_col]
     mov rax, [cursor_col]
-    cmp rax, 80
+    mov rbx, 80
+    cmp byte [fb_text_mode], 0
+    je .check_wrap
+    mov rbx, [fb_cols]
+.check_wrap:
+    cmp rax, rbx
     jl .echo_serial
     mov qword [cursor_col], 0
     call advance_row
@@ -2785,22 +3017,39 @@ putchar:
     pop rbx
     ret
 
-; advance_row: incrementa cursor_row; se passar da ultima linha (25 linhas,
-; 0-24), rola a tela uma linha pra cima em vez de escrever fora do buffer.
+; advance_row: incrementa cursor_row; se passar da ultima linha (25 no
+; modo texto VGA, ou fb_rows no framebuffer), rola a tela uma linha pra
+; cima em vez de escrever fora do buffer.
 advance_row:
+    push rax
+
     inc qword [cursor_row]
-    cmp qword [cursor_row], 25
+    mov rax, 25
+    cmp byte [fb_text_mode], 0
+    je .check
+    mov rax, [fb_rows]
+.check:
+    cmp [cursor_row], rax
     jl .done
     call scroll_screen
-    mov qword [cursor_row], 24
+    dec rax
+    mov [cursor_row], rax
 .done:
+    pop rax
     ret
 
-; scroll_screen: copia as linhas 1-24 pra 0-23 e limpa a linha 24.
+; scroll_screen: copia todas as linhas de texto exceto a primeira uma
+; posicao pra cima, e limpa a ultima. Framebuffer: mexe linhas de PIXEL
+; (8 por linha de texto, fonte 8x8); VGA texto: mexe celulas de 2 bytes.
 scroll_screen:
+    push rax
+    push rbx
+    push rcx
     push rsi
     push rdi
-    push rcx
+
+    cmp byte [fb_text_mode], 0
+    jne .fb_scroll
 
     mov rsi, 0xB8000 + 160
     mov rdi, 0xB8000
@@ -2811,10 +3060,52 @@ scroll_screen:
     mov rax, 0x0F200F200F200F20   ; 4 celulas "espaco, atributo 0x0F" por vez
     mov rcx, 160 / 8
     rep stosq
+    jmp .done
 
-    pop rcx
+.fb_scroll:
+    ; desloca [pitch*8, pitch*altura) pra [0, pitch*(altura-8)) -- move
+    ; tudo 8 pixels de altura (1 linha de texto) pra cima.
+    mov rax, [fb_pitch]
+    mov rbx, 8
+    mul rbx
+    mov rsi, [fb_base]
+    add rsi, rax                    ; rsi = fb_base + pitch*8
+
+    mov rdi, [fb_base]
+
+    mov rax, [fb_pitch]
+    mov rbx, [fb_height]
+    sub rbx, 8
+    mul rbx
+    mov rcx, rax
+    shr rcx, 3
+    rep movsq
+
+    ; limpa a ultima linha de texto (8 pixels de altura) com a cor de fundo
+    mov rax, [fb_pitch]
+    mov rbx, [fb_height]
+    sub rbx, 8
+    mul rbx
+    add rax, [fb_base]
+    mov rdi, rax
+
+    mov rax, [fb_pitch]
+    mov rbx, 8
+    mul rbx
+    mov rcx, rax
+    shr rcx, 2                        ; /4 -- rep stosd escreve dwords (1 pixel cada)
+
+    call fb_pack_bg                    ; eax = cor de fundo empacotada (por
+                                         ; ultimo, de proposito -- so precisa
+                                         ; sobreviver ate o rep stosd logo abaixo)
+    rep stosd
+
+.done:
     pop rdi
     pop rsi
+    pop rcx
+    pop rbx
+    pop rax
     ret
 
 ; print_string: RSI = ponteiro pra string terminada em 0
@@ -2897,6 +3188,21 @@ hex_nibble_to_ascii:
 
 cursor_row dq 0
 cursor_col dq 0
+
+; estado do framebuffer (preenchido por fb_init a partir de FB_INFO_ADDR,
+; ver comentario la em cima). fb_cols/fb_rows sao em CARACTERES (fonte
+; 8x8), nao pixels -- equivalente ao 80x25 fixo do modo texto VGA.
+fb_text_mode db 0
+fb_base      dq 0
+fb_width     dq 0
+fb_height    dq 0
+fb_pitch     dq 0
+fb_cols      dq 0
+fb_rows      dq 0
+fb_red_pos   db 0
+fb_green_pos db 0
+fb_blue_pos  db 0
+
 shift_pressed db 0
 app_reading_input db 0
 app_input_char    db 0
@@ -2969,7 +3275,7 @@ msg_spawn_start db "spawn: duas tarefas rodando via round-robin preemptivo...", 
 msg_spawn_done  db 10, "spawn: as duas tarefas terminaram (syscall exit), de volta ao shell.", 10, 0
 msg_spawn_usage db "uso: spawn (demo A/B) ou spawn <app1> <app2> (dois programas do EVAFS)", 10, 0
 
-msg_vbe_found db "vbe: framebuffer linear disponivel (detectado pelo stage2, ainda nao ativado)", 10, 0
+msg_vbe_found db "vbe: framebuffer linear ativo (troca de modo feita pelo stage2 no boot)", 10, 0
 msg_vbe_res   db "  resolucao: 0x", 0
 msg_vbe_x     db " x 0x", 0
 msg_vbe_bpp   db " bpp=0x", 0
@@ -3085,6 +3391,8 @@ name_res db "Reservado", 0
 align 8
 frame_bitmap:
     times (BITMAP_FRAMES / 8) db 0
+
+%include "kernel/font8x8.inc"
 
 ; KERNEL_SECTORS (stage2.asm) * 512 -- manter em sincronia com stage2.asm
 times KERNEL_IMAGE_SIZE - ($ - $$) db 0

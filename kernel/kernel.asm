@@ -1468,6 +1468,11 @@ shell_execute:
     test al, al
     jnz .do_vbe
 
+    mov rdi, cmd_gfx
+    call str_equal
+    test al, al
+    jnz .do_gfx
+
     mov rdi, cmd_format
     call str_equal
     test al, al
@@ -1761,6 +1766,53 @@ shell_execute:
 
 .vbe_none:
     mov rsi, msg_vbe_none
+    call print_string
+    jmp .done
+
+.do_gfx:
+    ; demo minima de fb_fill_rect: 4 retangulos coloridos num canto da
+    ; tela, longe de onde o texto do shell normalmente fica. NAO e uma
+    ; camada separada -- vive no MESMO framebuffer que o texto, entao um
+    ; scroll subsequente desloca (e eventualmente apaga) esses pixels
+    ; junto -- esperado nesta fase (ainda nao ha composicao de janelas,
+    ; so a prova de que desenhar pixels arbitrarios funciona).
+    cmp byte [fb_text_mode], 0
+    je .gfx_none
+
+    mov rdi, 700
+    mov rsi, 500
+    mov rdx, 100
+    mov rcx, 80
+    mov r8d, 0x00FF0000        ; vermelho
+    call fb_fill_rect
+
+    mov rdi, 820
+    mov rsi, 500
+    mov rdx, 100
+    mov rcx, 80
+    mov r8d, 0x0000FF00         ; verde
+    call fb_fill_rect
+
+    mov rdi, 700
+    mov rsi, 600
+    mov rdx, 100
+    mov rcx, 80
+    mov r8d, 0x000000FF          ; azul
+    call fb_fill_rect
+
+    mov rdi, 820
+    mov rsi, 600
+    mov rdx, 100
+    mov rcx, 80
+    mov r8d, 0x00FFFF00           ; amarelo
+    call fb_fill_rect
+
+    mov rsi, msg_gfx_ok
+    call print_string
+    jmp .done
+
+.gfx_none:
+    mov rsi, msg_gfx_none
     call print_string
     jmp .done
 
@@ -2865,6 +2917,106 @@ fb_pack_bg:
     mov eax, FB_BG_COLOR
     jmp fb_pack_color
 
+; fb_fill_rect: RDI=x, RSI=y, RDX=largura, RCX=altura, R8D=cor
+; (0x00RRGGBB, empacotada aqui dentro). Recorta contra os limites da
+; tela -- nao escreve fora do framebuffer mesmo se as coordenadas/
+; tamanho pedirem algo maior. Nao faz nada se fb_text_mode=0 (sem
+; framebuffer, nao ha onde desenhar). Primitiva de mais baixo nivel do
+; que fb_draw_glyph -- base pra qualquer coisa visual alem de texto
+; (retangulos de janela, widgets, etc., mais pra frente).
+fb_fill_rect:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    push r12
+    push r13
+
+    cmp byte [fb_text_mode], 0
+    je .done
+
+    mov eax, r8d
+    call fb_pack_color
+    mov r12d, eax                 ; cor empacotada, guardada ANTES de reusar
+                                    ; r8 como "x" mais abaixo
+
+    ; recorte contra os limites da tela (so precisa cortar direita/baixo --
+    ; x/y sao registradores sem sinal, "negativo" nao existe aqui)
+    mov rax, rdi
+    add rax, rdx
+    cmp rax, [fb_width]
+    jbe .width_ok
+    mov rax, [fb_width]
+    sub rax, rdi
+    mov rdx, rax
+.width_ok:
+    mov rax, rsi
+    add rax, rcx
+    cmp rax, [fb_height]
+    jbe .height_ok
+    mov rax, [fb_height]
+    sub rax, rsi
+    mov rcx, rax
+.height_ok:
+    cmp rdi, [fb_width]
+    jae .done
+    cmp rsi, [fb_height]
+    jae .done
+    test rdx, rdx
+    jz .done
+    test rcx, rcx
+    jz .done
+
+    mov r8, rdi              ; x, fixo pro resto da funcao
+    mov r13, rsi               ; y atual (avanca 1 por linha)
+    mov r10, rdx                ; largura, fixo
+    mov r11, rcx                 ; altura restante
+
+.row_loop:
+    ; endereco do 1o pixel desta linha: fb_base + y*pitch + x*4 (mesmo
+    ; cuidado de sempre: "mul" clobra RDX, entao roda antes de qualquer
+    ; coisa que precise de RDX nesta iteracao)
+    mov rax, r13
+    mov rbx, [fb_pitch]
+    mul rbx
+    add rax, [fb_base]
+    mov rbx, r8
+    shl rbx, 2
+    add rax, rbx
+    mov rdi, rax
+
+    mov r9, r10                  ; contador de colunas desta linha
+.col_loop:
+    mov [rdi], r12d
+    add rdi, 4
+    dec r9
+    jnz .col_loop
+
+    inc r13
+    dec r11
+    jnz .row_loop
+
+.done:
+    pop r13
+    pop r12
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
 ; fb_draw_glyph: AL = caractere. Desenha o glifo 8x8 correspondente
 ; (font8x8, indexada por char-32) na posicao de pixel atual
 ; (cursor_col*8, cursor_row*8), FB_FG_COLOR sobre FB_BG_COLOR. Nao mexe
@@ -3261,7 +3413,7 @@ shell_len db 0
 
 msg_prompt      db "EVA> ", 0
 msg_unknown_cmd db "comando desconhecido: ", 0
-msg_help_text   db "comandos: help mem clear about disk run run <nome> install", 10, "          user priv echo spawn spawn <a> <b> vbe format ls cat <nome> write <nome> <texto>", 10, 0
+msg_help_text   db "comandos: help mem clear about disk run run <nome> install", 10, "          user priv echo spawn spawn <a> <b> vbe gfx format ls cat <nome> write <nome> <texto>", 10, 0
 msg_about       db "EVA OS - kernel experimental em Assembly (modo longo 64-bit)", 10, 0
 msg_disk_ok     db "disk: leu o setor de boot (LBA 0) via ATA PIO -- assinatura 55 AA OK", 10, 0
 msg_disk_fail   db "disk: leu o setor, mas a assinatura de boot nao bateu", 10, 0
@@ -3284,6 +3436,8 @@ msg_vbe_pitch db "  pitch (bytes por linha): 0x", 0
 msg_vbe_none  db "vbe: nenhum modo grafico com framebuffer linear encontrado -- seguindo em modo texto", 10, 0
 msg_vbe_fb_ok   db "vbe: teste de escrita/leitura no framebuffer OK -- identity map confere.", 10, 0
 msg_vbe_fb_fail db "vbe: teste de escrita/leitura no framebuffer FALHOU -- endereco nao mapeado direito.", 10, 0
+msg_gfx_ok   db "gfx: 4 retangulos desenhados via fb_fill_rect.", 10, 0
+msg_gfx_none db "gfx: sem framebuffer disponivel (modo texto VGA).", 10, 0
 
 msg_fs_write_ok   db "write: arquivo salvo.", 10, 0
 msg_fs_not_ready  db "EVAFS nao formatado. Rode: format", 10, 0
@@ -3317,6 +3471,7 @@ cmd_echo  db "echo", 0
 cmd_spawn db "spawn", 0
 cmd_spawn_prefix db "spawn ", 0
 cmd_vbe db "vbe", 0
+cmd_gfx db "gfx", 0
 cmd_format db "format", 0
 cmd_ls     db "ls", 0
 cmd_write_prefix db "write ", 0

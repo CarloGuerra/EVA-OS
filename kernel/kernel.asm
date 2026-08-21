@@ -125,8 +125,20 @@ kernel_entry:
     je .no_command
     mov byte [command_pending], 0
     mov rsi, shell_buf
+    cmp byte [py_mode], 0
+    jne .py_dispatch
     call shell_execute
+    jmp .after_exec
+.py_dispatch:
+    call py_execute_line
+.after_exec:
+    cmp byte [py_mode], 0
+    jne .print_py_prompt
     mov rsi, msg_prompt
+    call print_string
+    jmp .no_command
+.print_py_prompt:
+    mov rsi, msg_py_prompt
     call print_string
 .no_command:
     hlt                  ; dorme ate a proxima interrupcao
@@ -1473,6 +1485,11 @@ shell_execute:
     test al, al
     jnz .do_gfx
 
+    mov rdi, cmd_py
+    call str_equal
+    test al, al
+    jnz .do_py
+
     mov rdi, cmd_format
     call str_equal
     test al, al
@@ -1816,6 +1833,15 @@ shell_execute:
     call print_string
     jmp .done
 
+.do_py:
+    ; entra no modo REPL Python -- so liga a flag e troca o prompt; quem
+    ; desvia as linhas seguintes pro interpretador em vez do shell e o
+    ; ".idle" de kernel_entry (ver comentario la).
+    mov byte [py_mode], 1
+    mov rsi, msg_py_banner
+    call print_string
+    jmp .done
+
 .do_format:
     call fs_format
     jmp .done
@@ -1870,6 +1896,541 @@ shell_execute:
 .cat_usage:
     mov rsi, msg_cat_usage
     call print_string
+
+.done:
+    ret
+
+; =======================================================================
+; interpretador Python (MVP, kernel-resident)
+;
+; Decisao de arquitetura (registrada aqui de proposito, pra nao virar
+; permanente por inercia): roda dentro do kernel (ring0), chamando
+; kmalloc/print_string/putchar direto, em vez de como app ring3 pela
+; EVAFS. Motivo: hoje ring3 so tem a stack fixa de 64 KiB do app, sem
+; NENHUM syscall de heap (sys_read_char/write/write_char/exit e so) --
+; um interpretador de verdade precisa de tabela de variaveis e buffers
+; dinamicos. Ficar kernel-resident tira essa dependencia do caminho e
+; da um REPL funcionando bem mais rapido. DEBITO TECNICO: migrar pra
+; ring3 quando existir um syscall de alocacao de memoria pra userspace
+; (sys_brk ou equivalente) -- so ai faz sentido isolar o interpretador
+; do kernel de verdade.
+;
+; Escopo do MVP (decidido por design antes de escrever qualquer linha):
+; inteiros de 64 bits com sinal, variaveis, "print(expr)", e eco de
+; expressao solta (como o REPL de verdade). SEM while/for/def/if ainda
+; -- um loop obriga a decidir entre reavaliar texto ou guardar uma AST,
+; e essa decisao merece ser tomada sozinha, nao sob pressao do MVP.
+; Gramatica (recursive descent, avalia direto sem montar AST):
+;   linha := "exit()"/"exit"/"sair" | "print(" expr ")" | ident "=" expr
+;            | expr
+;   expr  := termo (("+"|"-") termo)*
+;   termo := fator (("*"|"/") fator)*
+;   fator := numero | ident | "(" expr ")" | "-" fator
+;
+; Convencao interna: em vez de passar ponteiro de linha por registrador
+; entre as funcoes mutuamente recursivas, todas leem/avancam a posicao
+; atual via a variavel global py_cursor (mais simples que ficar
+; empilhando/desempilhando um "RSI de leitura" a cada nivel). Cada
+; funcao que usa r12/rbx como acumulador local faz push/pop dele mesma
+; (convencao "callee-saved" manual) -- e o que garante que a recursao
+; (fator -> expr -> termo -> fator, pros parenteses) nao corrompe o
+; acumulador de um nivel de fora.
+; =======================================================================
+
+PY_MAX_VARS       equ 32
+PY_VAR_NAME_SIZE  equ 16          ; 15 chars + terminador
+PY_VAR_SLOT_SIZE  equ 24          ; name(16) + valor qword(8)
+PY_IDENT_MAX      equ 15          ; precisa caber em PY_VAR_NAME_SIZE-1
+
+; py_skip_ws: consome espacos a partir de py_cursor.
+py_skip_ws:
+.loop:
+    call py_peek
+    cmp al, ' '
+    jne .done
+    call py_advance
+    jmp .loop
+.done:
+    ret
+
+; py_peek: AL = caractere na posicao atual (nao consome).
+py_peek:
+    mov rsi, [py_cursor]
+    mov al, [rsi]
+    ret
+
+; py_advance: avanca py_cursor um byte.
+py_advance:
+    inc qword [py_cursor]
+    ret
+
+; py_parse_number: assume que o char atual e digito. RAX = valor lido
+; (sem sinal -- o sinal e tratado em py_parse_factor, via unario "-").
+py_parse_number:
+    xor r10, r10
+.loop:
+    call py_peek
+    cmp al, '0'
+    jb .done
+    cmp al, '9'
+    ja .done
+    movzx rcx, al
+    sub rcx, '0'
+    imul r10, r10, 10
+    add r10, rcx
+    call py_advance
+    jmp .loop
+.done:
+    mov rax, r10
+    ret
+
+; py_parse_ident: copia [a-zA-Z0-9_]+ a partir de py_cursor pra
+; py_ident_buf (terminado em 0, truncado em PY_IDENT_MAX chars). Quem
+; chama ja garantiu que o char atual e valido pra COMECAR um identificador
+; (letra ou "_" -- nunca digito).
+py_parse_ident:
+    mov rdi, py_ident_buf
+    xor r11, r11
+.loop:
+    call py_peek
+    cmp al, 'a'
+    jb .check_upper
+    cmp al, 'z'
+    jbe .is_ident
+    jmp .check_digit_us
+.check_upper:
+    cmp al, 'A'
+    jb .check_digit_us
+    cmp al, 'Z'
+    jbe .is_ident
+.check_digit_us:
+    cmp al, '0'
+    jb .check_us
+    cmp al, '9'
+    jbe .is_ident
+    jmp .not_ident
+.check_us:
+    cmp al, '_'
+    je .is_ident
+.not_ident:
+    jmp .done
+.is_ident:
+    cmp r11, PY_IDENT_MAX
+    jae .skip_store
+    mov [rdi + r11], al
+    inc r11
+.skip_store:
+    call py_advance
+    jmp .loop
+.done:
+    mov byte [rdi + r11], 0
+    ret
+
+; py_var_lookup: procura o nome em py_ident_buf na tabela. RAX = ponteiro
+; pro slot se achar, 0 se nao achar.
+py_var_lookup:
+    push rbx
+    push rcx
+    xor rbx, rbx
+    movzx rcx, byte [py_var_count]
+.loop:
+    cmp rbx, rcx
+    jge .not_found
+    mov rax, rbx
+    imul rax, PY_VAR_SLOT_SIZE
+    add rax, py_var_table
+    push rax
+    mov rdi, rax
+    mov rsi, py_ident_buf
+    call str_equal
+    pop rax
+    test al, al
+    jnz .found
+    inc rbx
+    jmp .loop
+.found:
+    pop rcx
+    pop rbx
+    ret
+.not_found:
+    xor rax, rax
+    pop rcx
+    pop rbx
+    ret
+
+; py_var_get: nome em py_ident_buf. RAX = valor, ou 0 com
+; py_error_flag=2 (NameError) se a variavel nao existir.
+py_var_get:
+    call py_var_lookup
+    test rax, rax
+    jnz .found
+    mov byte [py_error_flag], 2
+    xor rax, rax
+    ret
+.found:
+    mov rax, [rax + PY_VAR_NAME_SIZE]
+    ret
+
+; py_var_set: nome em py_ident_buf, RDX = valor a guardar. Atualiza se
+; ja existir, cria se houver espaco (ate PY_MAX_VARS).
+py_var_set:
+    push rdx
+    call py_var_lookup
+    pop rdx
+    test rax, rax
+    jnz .store
+
+    movzx rcx, byte [py_var_count]
+    cmp rcx, PY_MAX_VARS
+    jae .no_space
+    mov rax, rcx
+    imul rax, PY_VAR_SLOT_SIZE
+    add rax, py_var_table
+
+    push rax
+    push rdx
+    mov rdi, rax
+    mov rsi, py_ident_buf
+    xor rcx, rcx
+.copy_name:
+    mov al, [rsi + rcx]
+    mov [rdi + rcx], al
+    test al, al
+    jz .name_done
+    inc rcx
+    cmp rcx, PY_VAR_NAME_SIZE - 1
+    jb .copy_name
+    mov byte [rdi + rcx], 0
+.name_done:
+    pop rdx
+    pop rax
+    inc byte [py_var_count]
+.store:
+    mov [rax + PY_VAR_NAME_SIZE], rdx
+    ret
+.no_space:
+    mov byte [py_error_flag], 1     ; sem espaco pra variavel nova (reaproveita SyntaxError)
+    ret
+
+; py_parse_factor: numero | ident | "(" expr ")" | "-" fator. RAX = valor.
+py_parse_factor:
+    call py_skip_ws
+    call py_peek
+    cmp al, '-'
+    jne .not_neg
+    call py_advance
+    call py_skip_ws
+    call py_parse_factor
+    neg rax
+    ret
+
+.not_neg:
+    cmp al, '('
+    jne .not_paren
+    call py_advance
+    call py_skip_ws
+    call py_parse_expr
+    push rax
+    call py_skip_ws
+    call py_peek
+    cmp al, ')'
+    jne .paren_error
+    call py_advance
+    pop rax
+    ret
+.paren_error:
+    pop rax
+    mov byte [py_error_flag], 1
+    xor rax, rax
+    ret
+
+.not_paren:
+    cmp al, '0'
+    jb .not_digit
+    cmp al, '9'
+    ja .not_digit
+    call py_parse_number
+    ret
+
+.not_digit:
+    cmp al, '_'
+    je .is_ident_start
+    cmp al, 'a'
+    jb .check_upper2
+    cmp al, 'z'
+    jbe .is_ident_start
+.check_upper2:
+    cmp al, 'A'
+    jb .bad_factor
+    cmp al, 'Z'
+    ja .bad_factor
+.is_ident_start:
+    call py_parse_ident
+    call py_var_get
+    ret
+.bad_factor:
+    mov byte [py_error_flag], 1
+    xor rax, rax
+    ret
+
+; py_parse_term: fator (("*"|"/") fator)*. RAX = valor.
+py_parse_term:
+    push r12
+    call py_parse_factor
+    mov r12, rax
+.loop:
+    call py_skip_ws
+    call py_peek
+    cmp al, '*'
+    je .mul
+    cmp al, '/'
+    je .div
+    jmp .done
+.mul:
+    call py_advance
+    call py_skip_ws
+    call py_parse_factor
+    imul r12, rax
+    jmp .loop
+.div:
+    call py_advance
+    call py_skip_ws
+    call py_parse_factor
+    test rax, rax
+    jnz .do_div
+    ; divisor zero -- NUNCA deixar chegar no idiv abaixo: um #DE em
+    ; ring0 cai no handler de excecao do kernel, que trata falha em
+    ; CPL0 como fatal (para a CPU). Detectar aqui e obrigatorio, nao
+    ; cosmetico.
+    mov byte [py_error_flag], 3
+    xor r12, r12
+    jmp .done
+.do_div:
+    mov rbx, rax
+    mov rax, r12
+    cqo
+    idiv rbx
+    mov r12, rax
+    jmp .loop
+.done:
+    mov rax, r12
+    pop r12
+    ret
+
+; py_parse_expr: termo (("+"|"-") termo)*. RAX = valor.
+py_parse_expr:
+    push r12
+    call py_parse_term
+    mov r12, rax
+.loop:
+    call py_skip_ws
+    call py_peek
+    cmp al, '+'
+    je .add
+    cmp al, '-'
+    je .sub
+    jmp .done
+.add:
+    call py_advance
+    call py_skip_ws
+    call py_parse_term
+    add r12, rax
+    jmp .loop
+.sub:
+    call py_advance
+    call py_skip_ws
+    call py_parse_term
+    sub r12, rax
+    jmp .loop
+.done:
+    mov rax, r12
+    pop r12
+    ret
+
+; py_print_dec_signed: RAX = valor com sinal, imprime em decimal (sem
+; quebra de linha).
+py_print_dec_signed:
+    push rax
+    push rbx
+    push rcx
+    push rdx
+
+    test rax, rax
+    jns .no_sign
+    push rax
+    mov al, '-'
+    call putchar
+    pop rax
+    neg rax
+.no_sign:
+    test rax, rax
+    jnz .nonzero
+    mov al, '0'
+    call putchar
+    jmp .done
+.nonzero:
+    xor rcx, rcx
+    mov rbx, 10
+.divloop:
+    xor rdx, rdx
+    div rbx
+    push rdx
+    inc rcx
+    test rax, rax
+    jnz .divloop
+.printloop:
+    pop rax
+    add al, '0'
+    call putchar
+    dec rcx
+    jnz .printloop
+.done:
+    pop rdx
+    pop rcx
+    pop rbx
+    pop rax
+    ret
+
+; py_print_error: mensagem de acordo com py_error_flag (1=Syntax,
+; 2=Name, 3=ZeroDivision).
+py_print_error:
+    mov al, [py_error_flag]
+    cmp al, 2
+    je .name
+    cmp al, 3
+    je .zerodiv
+    mov rsi, msg_py_syntax_error
+    jmp .print
+.name:
+    mov rsi, msg_py_name_error
+    jmp .print
+.zerodiv:
+    mov rsi, msg_py_zerodiv_error
+.print:
+    call print_string
+    ret
+
+; py_execute_line: RSI = linha digitada (terminada em 0), mesma
+; convencao de shell_execute (pra poder trocar de lugar no ".idle").
+py_execute_line:
+    mov [py_cursor], rsi
+    mov byte [py_error_flag], 0
+
+    call py_skip_ws
+    call py_peek
+    test al, al
+    jz .done                       ; linha em branco -- nao faz nada
+
+    mov rsi, [py_cursor]
+    mov rdi, py_exit1
+    call str_equal
+    test al, al
+    jnz .do_exit
+    mov rsi, [py_cursor]
+    mov rdi, py_exit2
+    call str_equal
+    test al, al
+    jnz .do_exit
+    mov rsi, [py_cursor]
+    mov rdi, py_exit3
+    call str_equal
+    test al, al
+    jnz .do_exit
+
+    mov rsi, [py_cursor]
+    mov rdi, py_kw_print
+    call str_prefix
+    test al, al
+    jz .not_print
+    mov [py_cursor], rsi
+    jmp .do_print
+.not_print:
+
+    ; lookahead de atribuicao: so tenta se o 1o char puder comecar um
+    ; identificador (letra ou "_"); numero/"("/"-" vao direto pra expr.
+    call py_peek
+    cmp al, '_'
+    je .try_assign
+    cmp al, 'a'
+    jb .check_upper3
+    cmp al, 'z'
+    jbe .try_assign
+.check_upper3:
+    cmp al, 'A'
+    jb .plain_expr
+    cmp al, 'Z'
+    ja .plain_expr
+.try_assign:
+    mov rax, [py_cursor]
+    mov [py_saved_cursor], rax
+    call py_parse_ident
+    call py_skip_ws
+    call py_peek
+    cmp al, '='
+    jne .restore_and_expr
+    mov rsi, [py_cursor]
+    inc rsi
+    cmp byte [rsi], '='
+    je .restore_and_expr           ; "==" -- nao suportado ainda, cai pra expr (vira erro de sintaxe, ok pro MVP)
+    call py_advance
+    call py_skip_ws
+    call py_parse_expr
+    cmp byte [py_error_flag], 0
+    jne .after_expr_error
+    mov rdx, rax
+    call py_var_set
+    jmp .done
+.restore_and_expr:
+    mov rax, [py_saved_cursor]
+    mov [py_cursor], rax
+.plain_expr:
+    call py_parse_expr
+    cmp byte [py_error_flag], 0
+    jne .after_expr_error
+    push rax                       ; py_skip_ws/py_peek clobram RAX (AL e' o retorno de peek) -- salvar antes de checar sobra na linha
+    call py_skip_ws
+    call py_peek
+    test al, al
+    pop rax
+    jnz .trailing_garbage
+    call py_print_dec_signed
+    mov rsi, msg_newline2
+    call print_string
+    jmp .done
+
+.do_print:
+    call py_skip_ws
+    call py_parse_expr
+    cmp byte [py_error_flag], 0
+    jne .after_expr_error
+    push rax
+    call py_skip_ws
+    call py_peek
+    cmp al, ')'
+    jne .print_syntax_error_pop
+    call py_advance
+    pop rax
+    call py_print_dec_signed
+    mov rsi, msg_newline2
+    call print_string
+    jmp .done
+
+.print_syntax_error_pop:
+    pop rax
+    mov byte [py_error_flag], 1
+    jmp .after_expr_error
+
+.trailing_garbage:
+    mov byte [py_error_flag], 1
+    jmp .after_expr_error
+
+.after_expr_error:
+    call py_print_error
+    jmp .done
+
+.do_exit:
+    mov byte [py_mode], 0
+    jmp .done
 
 .done:
     ret
@@ -3411,9 +3972,30 @@ msg_krealloc   db "kmalloc: liberou o do meio e alocou de novo -> ", 0
 shell_buf: times SHELL_BUF_SIZE db 0
 shell_len db 0
 
+; --- interpretador Python (MVP, kernel-resident -- ver comentario de
+; secao acima de shell_execute pra decisao de arquitetura) ---
+py_mode         db 0
+py_cursor       dq 0
+py_saved_cursor dq 0
+py_error_flag   db 0
+py_ident_buf:   times (PY_IDENT_MAX + 1) db 0
+py_var_count    db 0
+py_var_table:   times (PY_MAX_VARS * PY_VAR_SLOT_SIZE) db 0
+
+py_exit1    db "exit()", 0
+py_exit2    db "exit", 0
+py_exit3    db "sair", 0
+py_kw_print db "print(", 0
+
+msg_py_banner       db "EVA Python (MVP) -- inteiros, variaveis, print(). Digite exit() para sair.", 10, 0
+msg_py_prompt       db ">>> ", 0
+msg_py_syntax_error db "SyntaxError", 10, 0
+msg_py_name_error   db "NameError: variavel nao definida", 10, 0
+msg_py_zerodiv_error db "ZeroDivisionError: divisao por zero", 10, 0
+
 msg_prompt      db "EVA> ", 0
 msg_unknown_cmd db "comando desconhecido: ", 0
-msg_help_text   db "comandos: help mem clear about disk run run <nome> install", 10, "          user priv echo spawn spawn <a> <b> vbe gfx format ls cat <nome> write <nome> <texto>", 10, 0
+msg_help_text   db "comandos: help mem clear about disk run run <nome> install", 10, "          user priv echo spawn spawn <a> <b> vbe gfx py format ls cat <nome> write <nome> <texto>", 10, 0
 msg_about       db "EVA OS - kernel experimental em Assembly (modo longo 64-bit)", 10, 0
 msg_disk_ok     db "disk: leu o setor de boot (LBA 0) via ATA PIO -- assinatura 55 AA OK", 10, 0
 msg_disk_fail   db "disk: leu o setor, mas a assinatura de boot nao bateu", 10, 0
@@ -3472,6 +4054,7 @@ cmd_spawn db "spawn", 0
 cmd_spawn_prefix db "spawn ", 0
 cmd_vbe db "vbe", 0
 cmd_gfx db "gfx", 0
+cmd_py db "py", 0
 cmd_format db "format", 0
 cmd_ls     db "ls", 0
 cmd_write_prefix db "write ", 0
